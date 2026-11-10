@@ -1,6 +1,6 @@
 {
   // Konfiguration für den Konto-Dienst (Cloudflare Worker). Cloudflare liest sie beim Bereitstellen aus GitHub.
-  // Der Name muss genau der des vorhandenen Workers sein.
+  // Der Name muss genau der des vorhandenen Workers sein. 
   "name": "winter-violet-1a11",
   "main": "konto-dienst.mjs",
   "compatibility_date": "2026-01-01",
