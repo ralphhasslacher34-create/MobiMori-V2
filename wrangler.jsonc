@@ -1,16 +1,18 @@
 {
-  // Konfiguration für den Konto-Dienst (Cloudflare Worker). Cloudflare liest sie beim Bereitstellen aus GitHub.
-  // Der Name muss genau der des vorhandenen Workers sein. 
+  // Der Dienst-Programmtext und diese Datei liegen einzeln im HAUPTVERZEICHNIS des Repositorys (nicht im Ordner server/), siehe EINRICHTUNG.md, Abschnitt 3.
+  // Cloudflare baut den Dienst bei jeder Änderung selbst („npx wrangler deploy“). Der Name muss zum Worker im Dashboard passen.
   "name": "winter-violet-1a11",
   "main": "konto-dienst.mjs",
-  "compatibility_date": "2026-01-01",
-  // Variablen, die im Dashboard stehen (ERLAUBTE_URSPRUENGE, ENTWICKLUNG) und das Geheimnis PASSWORT_PEPPER bleiben erhalten.
+  "compatibility_date": "2026-11-01",
+  // Die Variablen aus dem Dashboard (ERLAUBTE_URSPRUENGE, ENTWICKLUNG) und das Geheimnis PASSWORT_PEPPER bleiben bei jedem Bau erhalten.
   "keep_vars": true,
   "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "mobimory-konten-test",
-      "database_id": "10f467cb-4ae5-431c-a7f8-21ff89ae5bc7"
-    }
+    { "binding": "DB", "database_name": "mobimory-konten-test", "database_id": "10f467cb-4ae5-431c-a7f8-21ff89ae5bc7" }
+  ],
+  "r2_buckets": [
+    // Der Bucket wurde mit der Jurisdiktion EU angelegt, deshalb muss sie hier stehen.
+    { "binding": "DATEN", "bucket_name": "mobimory-daten-test", "jurisdiction": "eu" }
   ]
+  // Echter Dienst später: anderer Name, andere Datenbank und anderer Bucket (ohne Variable ENTWICKLUNG), dazu
+  // "send_email": [{ "name": "EMAIL" }] und die Variable ABSENDER. Geheimnis PASSWORT_PEPPER: npx wrangler secret put PASSWORT_PEPPER
 }
