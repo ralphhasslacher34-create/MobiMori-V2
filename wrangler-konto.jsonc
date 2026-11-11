@@ -1,0 +1,27 @@
+{
+  // Echter Konto-Dienst von MobiMory (Worker "mobimory-konto").
+  // Liegt im Hauptverzeichnis des Repositorys, neben wrangler.jsonc (Test-Dienst) und wrangler-app.jsonc (App).
+  // Deploy-Befehl im Worker: npx wrangler deploy --config wrangler-konto.jsonc
+  // Die Variable ENTWICKLUNG darf es hier NIE geben: Der Code geht nur per E-Mail raus.
+  // Das Geheimnis PASSWORT_PEPPER wird im Dashboard eingetragen (nie in diese Datei).
+  "name": "mobimory-konto",
+  "main": "konto-dienst.mjs",
+  "compatibility_date": "2026-11-01",
+  "keep_vars": true,
+  "routes": [
+    { "pattern": "konto.mobimory.com", "custom_domain": true }
+  ],
+  "vars": {
+    "ERLAUBTE_URSPRUENGE": "https://app.mobimory.com",
+    "ABSENDER": "konto@mobimory.com"
+  },
+  "send_email": [
+    { "name": "EMAIL" }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "mobimory-konten", "database_id": "2e0303a2-a669-4732-a933-cc2dc21eaa67" }
+  ],
+  "r2_buckets": [
+    { "binding": "DATEN", "bucket_name": "mobimory-daten", "jurisdiction": "eu" }
+  ]
+}
