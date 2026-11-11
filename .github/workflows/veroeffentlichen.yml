@@ -1,0 +1,29 @@
+name: MobiMory pruefen
+
+# Nur noch die Tests. Veroeffentlicht wird die App ueber Cloudflare (app.mobimory.com),
+# nicht mehr ueber GitHub Pages.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Neueste ZIP-Datei auspacken
+        run: |
+          ZIP=$(ls MobiMory-V2_*.zip | sort -V | tail -n 1)
+          echo "Verwendet wird: $ZIP"
+          mkdir app
+          unzip -q "$ZIP" -d app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Pruefen
+        run: cd app && npm test
