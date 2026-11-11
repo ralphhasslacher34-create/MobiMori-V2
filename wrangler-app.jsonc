@@ -1,0 +1,8 @@
+{
+  // Konfiguration für die App unter app.mobimory.com (Worker "lively-sun-5d7d").
+  // Liegt im Hauptverzeichnis des Repositorys, neben wrangler.jsonc des Konto-Dienstes.
+  // Cloudflare stellt die Ordner-Dateien aus _site bereit (wird im Build-Befehl erzeugt).
+  "name": "lively-sun-5d7d",
+  "compatibility_date": "2026-11-01",
+  "assets": { "directory": "./_site" }
+}
