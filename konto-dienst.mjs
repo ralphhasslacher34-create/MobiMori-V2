@@ -31,10 +31,14 @@
  * 13e: Stufen (Basic, Testwoche, Mittel, Voll, Entwickler ohne Grenzen) mit Grenzen für Geräte und Online-Checks. Die Online-Checks gehen über diesen Dienst: Er prüft Anmeldung,
  *      Stufe und Kontingent, zählt, reicht die Anfrage an den Recherche-Dienst weiter und speichert das Ergebnis (Check-Datenbank). Eine Testwoche je
  *      bestätigter E-Mail-Adresse. Vier weitere Tabellen (schema.sql, ab „13e“). Nötig dafür: Variable RECHERCHE_URL und Geheimnis RECHERCHE_TOKEN.
+ * 13e-3 (seit 2.0.71): Kosten-Wächter. Alle 15 Minuten (Cron-Auslöser in wrangler-konto.jsonc) prüft der Dienst, ob die Kosten der Testwochen im Verhältnis
+ *      zu den Einnahmen zu hoch werden oder ob zu viele neue Testwochen entstehen, und schickt dann höchstens eine Mail pro Stunde (nur Zahlen, keine Namen).
+ *      Eine weitere Tabelle „waechter_stand“ (schema.sql, 13e-3.sql). Nötig dafür: Variable WAECHTER_EMAIL (Empfänger). Alle Schwellen und Preise sind
+ *      Variablen mit Standardwerten (siehe „Kosten-Wächter“ weiter unten).
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13e-2';
+export const VERSION = '13e-3';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -1011,9 +1015,11 @@ async function gesundheit(env) {
   try { await datenbank(env).prepare('SELECT 1 FROM datei LIMIT 1').first(); dateien = true; } catch (e) { dateien = false; }
   try { const db = datenbank(env); await db.prepare('SELECT 1 FROM freigabe LIMIT 1').first(); await db.prepare('SELECT 1 FROM kontrolle LIMIT 1').first(); freigaben = true; } catch (e) { freigaben = false; }
   try { const db = datenbank(env); await db.prepare('SELECT 1 FROM stufe_konto LIMIT 1').first(); await db.prepare('SELECT 1 FROM testwoche LIMIT 1').first(); await db.prepare('SELECT 1 FROM check_nutzung LIMIT 1').first(); await db.prepare('SELECT 1 FROM check_ergebnis LIMIT 1').first(); stufen = true; } catch (e) { stufen = false; }
+  let waechter = false;
+  try { await datenbank(env).prepare('SELECT 1 FROM waechter_stand LIMIT 1').first(); waechter = !!(env && env.EMAIL && env.ABSENDER && waechterEmpfaenger(env)); } catch (e) { waechter = false; }
   return {
     ok: true, dienst: DIENST, version: VERSION,
-    datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen,
+    datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, waechter,
     recherche: !!(env && typeof env.RECHERCHE_URL === 'string' && /^https:\/\//.test(env.RECHERCHE_URL) && typeof env.RECHERCHE_TOKEN === 'string' && env.RECHERCHE_TOKEN.length >= 8),
     pepper: typeof (env && env.PASSWORT_PEPPER) === 'string' && env.PASSWORT_PEPPER.length >= 32,
     mail: !!(env && env.EMAIL && env.ABSENDER),
@@ -1255,6 +1261,160 @@ export async function behandeln(request, env, optionen) {
   }
 }
 
+/* ---------- 13e-3: Kosten-Wächter für die Testwochen (seit 2.0.71) ---------- */
+
+/* Standardwerte (Nutzer, 12.11.2026). Alles lässt sich als Variable im Konto-Worker ändern, ohne neue Version:
+     KOSTEN_CHECK            Kosten eines Online-Checks in Euro (Standard 0,45; nur eine Schätzung, der echte Wert kommt aus der OpenAI-Abrechnung)
+     PREIS_MITTEL, PREIS_VOLL   Preis je Monat in Euro (Standard 5 und 10, Richtwerte)
+     WAECHTER_ANTEIL         Warnung, wenn die Testwochen-Kosten diesen Anteil der Einnahmen überschreiten (Standard 0,2 = 20 %)
+     WAECHTER_TAGE           Zeitraum für die Rechnung in Tagen (Standard 30)
+     WAECHTER_CHECKS_TAG     Solange es keine Einnahmen gibt: höchstens so viele Testwochen-Checks in 24 Stunden (Standard 10)
+     WAECHTER_TESTWOCHEN_TAG Höchstens so viele neue Testwochen in 24 Stunden (Standard 5)
+     WAECHTER_EMAIL          Empfänger der Warnung (ohne sie wird nur geprüft und ins Protokoll geschrieben)
+     WAECHTER_AUSGENOMMEN    Mail-Adressen, durch Komma getrennt, die nicht mitzählen: eigene Test-Konten und geschenkte Voll-Konten
+   Das Konto mit der Stufe „entwickler“ zählt nie mit. */
+export const WAECHTER_STANDARD = { kostenCheck: 0.45, preisMittel: 5, preisVoll: 10, anteil: 0.2, tage: 30, checksTag: 10, testwochenTag: 5 };
+const WAECHTER_MAIL_ABSTAND = 60 * MINUTE;
+
+function zahlVariable(env, name, standard, min, max) {
+  const roh = env && env[name];
+  if (roh === undefined || roh === null || String(roh).trim() === '') return standard;
+  const z = Number(String(roh).trim().replace(',', '.'));
+  if (!Number.isFinite(z) || z < min || z > max) return standard;
+  return z;
+}
+
+function waechterEmpfaenger(env) {
+  const e = env && typeof env.WAECHTER_EMAIL === 'string' ? env.WAECHTER_EMAIL.trim() : '';
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : '';
+}
+
+function waechterAusgenommen(env) {
+  const roh = env && typeof env.WAECHTER_AUSGENOMMEN === 'string' ? env.WAECHTER_AUSGENOMMEN : '';
+  return roh.split(',').map((x) => x.trim().toLowerCase()).filter((x) => x.length > 0 && x.length < 255).slice(0, 50);
+}
+
+function euroText(x) { return (Math.round(x * 100) / 100).toFixed(2).replace('.', ',') + ' €'; }
+function prozentText(x) { return (Math.round(x * 1000) / 10).toString().replace('.', ',') + ' %'; }
+
+/* Rechnet die Werte aus der Datenbank. Gibt null zurück, wenn die nötigen Tabellen fehlen. */
+export async function waechterWerte(env, db, jetzt) {
+  const k = {
+    kostenCheck: zahlVariable(env, 'KOSTEN_CHECK', WAECHTER_STANDARD.kostenCheck, 0, 1000),
+    preisMittel: zahlVariable(env, 'PREIS_MITTEL', WAECHTER_STANDARD.preisMittel, 0, 100000),
+    preisVoll: zahlVariable(env, 'PREIS_VOLL', WAECHTER_STANDARD.preisVoll, 0, 100000),
+    anteil: zahlVariable(env, 'WAECHTER_ANTEIL', WAECHTER_STANDARD.anteil, 0.001, 1000),
+    tage: Math.round(zahlVariable(env, 'WAECHTER_TAGE', WAECHTER_STANDARD.tage, 1, 365)),
+    checksTag: zahlVariable(env, 'WAECHTER_CHECKS_TAG', WAECHTER_STANDARD.checksTag, 0, 1000000),
+    testwochenTag: zahlVariable(env, 'WAECHTER_TESTWOCHEN_TAG', WAECHTER_STANDARD.testwochenTag, 0, 1000000)
+  };
+  const kostenCheckGesetzt = !!(env && env.KOSTEN_CHECK !== undefined && String(env.KOSTEN_CHECK).trim() !== '' && k.kostenCheck === Number(String(env.KOSTEN_CHECK).trim().replace(',', '.')));
+  const aus = waechterAusgenommen(env);
+  const platz = aus.map(() => '?').join(',');
+  /* Nutzer, die nicht mitzählen: das Entwickler-Konto und die ausgenommenen Adressen. */
+  const ausNutzer = "SELECT nutzer_id FROM stufe_konto WHERE stufe = 'entwickler'" + (aus.length ? ' UNION SELECT id FROM nutzer WHERE lower(email) IN (' + platz + ')' : '');
+  const ausRaeume = 'SELECT id FROM datenraum WHERE nutzer_id IN (' + ausNutzer + ')';
+  try {
+    const von = jetzt - k.tage * TAG, tag = jetzt - TAG;
+    const c = await db.prepare("SELECT COUNT(*) AS n FROM check_nutzung WHERE stufe = 'test' AND status IN ('laeuft', 'ok') AND am > ? AND datenraum_id NOT IN (" + ausRaeume + ')')
+      .bind(von, ...aus).first();
+    const c24 = await db.prepare("SELECT COUNT(*) AS n FROM check_nutzung WHERE stufe = 'test' AND status IN ('laeuft', 'ok') AND am > ? AND datenraum_id NOT IN (" + ausRaeume + ')')
+      .bind(tag, ...aus).first();
+    const tw24 = await db.prepare('SELECT COUNT(*) AS n FROM testwoche WHERE start_am > ? AND nutzer_id NOT IN (' + ausNutzer + ')')
+      .bind(tag, ...aus).first();
+    const bezahlt = await db.prepare("SELECT stufe, COUNT(*) AS n FROM stufe_konto WHERE stufe IN ('mittel', 'voll') AND (gueltig_bis IS NULL OR gueltig_bis > ?) AND nutzer_id NOT IN (" + ausNutzer + ') GROUP BY stufe')
+      .bind(jetzt, ...aus).all();
+    let mittel = 0, voll = 0;
+    for (const r of (bezahlt.results || [])) { if (r.stufe === 'mittel') mittel = r.n; else if (r.stufe === 'voll') voll = r.n; }
+    const testChecks = c ? c.n : 0;
+    const kosten = testChecks * k.kostenCheck;
+    const einnahmenMonat = mittel * k.preisMittel + voll * k.preisVoll;
+    const einnahmenZeitraum = einnahmenMonat * (k.tage / 30);
+    return {
+      einstellungen: k, kostenCheckGesetzt, von, bis: jetzt,
+      testChecks, testChecks24: c24 ? c24.n : 0, neueTestwochen24: tw24 ? tw24.n : 0,
+      kontenMittel: mittel, kontenVoll: voll, kosten, einnahmenMonat, einnahmenZeitraum,
+      anteil: einnahmenZeitraum > 0 ? kosten / einnahmenZeitraum : null
+    };
+  } catch (e) {
+    if (fehltTabelle(e)) return null;
+    throw e;
+  }
+}
+
+/* Welche Regeln schlagen an? Solange es keine Einnahmen gibt, gelten feste Obergrenzen, sonst der Anteil der Kosten an den Einnahmen.
+   Die neuen Testwochen pro Tag gelten immer (ein plötzlicher Sprung deutet auf Missbrauch). */
+export function waechterGruende(w) {
+  const k = w.einstellungen, gruende = [];
+  if (w.einnahmenMonat > 0) {
+    if (w.anteil !== null && w.anteil > k.anteil) gruende.push('kosten-anteil');
+  } else if (w.testChecks24 > k.checksTag) {
+    gruende.push('checks-tag');
+  }
+  if (w.neueTestwochen24 > k.testwochenTag) gruende.push('testwochen-tag');
+  return gruende;
+}
+
+function waechterText(w, gruende) {
+  const k = w.einstellungen, z = [];
+  z.push('Der Kosten-Wächter von MobiMory meldet auffällige Werte bei den Testwochen.');
+  z.push('Zeitraum der Rechnung: ' + datumText(w.von) + ' bis ' + datumText(w.bis) + ' (' + k.tage + ' Tage). Stand: ' + new Date(w.bis).toISOString().slice(0, 16).replace('T', ' ') + ' UTC.');
+  const zeilen = [];
+  if (gruende.includes('kosten-anteil')) zeilen.push('- Die Kosten der Testwochen liegen bei ' + prozentText(w.anteil) + ' der Einnahmen (Schwelle ' + prozentText(k.anteil) + ').');
+  if (gruende.includes('checks-tag')) zeilen.push('- Es gibt noch keine Einnahmen, und in den letzten 24 Stunden gab es ' + w.testChecks24 + ' Testwochen-Checks (Obergrenze ' + k.checksTag + ').');
+  if (gruende.includes('testwochen-tag')) zeilen.push('- In den letzten 24 Stunden haben ' + w.neueTestwochen24 + ' neue Testwochen begonnen (Obergrenze ' + k.testwochenTag + ').');
+  z.push('Ausgelöst durch:\n' + zeilen.join('\n'));
+  z.push('Zahlen:\n'
+    + '- Testwochen-Checks im Zeitraum: ' + w.testChecks + ', davon in den letzten 24 Stunden: ' + w.testChecks24 + '\n'
+    + '- Neue Testwochen in den letzten 24 Stunden: ' + w.neueTestwochen24 + '\n'
+    + '- Kosten der Testwochen im Zeitraum: ' + euroText(w.kosten) + ' (' + euroText(k.kostenCheck) + ' je Check' + (w.kostenCheckGesetzt ? '' : ', Schätzwert, die Variable KOSTEN_CHECK ist nicht gesetzt') + ')\n'
+    + '- Bezahlte Konten: ' + w.kontenMittel + ' Mittel, ' + w.kontenVoll + ' Voll\n'
+    + '- Einnahmen (gerechnet aus den Konten und den Preisen, keine gemessene Zahl): ' + euroText(w.einnahmenZeitraum) + ' im Zeitraum');
+  z.push('Eine weitere Mail kommt frühestens in einer Stunde, falls die Werte bleiben. Die Schwellen und Preise stehen als Variablen im Konto-Worker.');
+  return z.join('\n\n');
+}
+
+/* Eine Prüfrunde. Sie läuft alle 15 Minuten (Cron-Auslöser) und ändert nichts an Konten oder Stufen.
+   Ergebnis: { geprueft, warnung, gruende, mail, werte } mit mail = 'gesendet', 'gedrosselt', 'kein-empfaenger', 'fehlgeschlagen' oder 'keine'. */
+export async function waechterPruefen(env, db, jetzt) {
+  const w = await waechterWerte(env, db, jetzt);
+  if (!w) return { geprueft: false, warnung: false, gruende: [], mail: 'keine', werte: null };
+  const gruende = waechterGruende(w);
+  if (!gruende.length) return { geprueft: true, warnung: false, gruende, mail: 'keine', werte: w };
+  const an = waechterEmpfaenger(env);
+  if (!an) return { geprueft: true, warnung: true, gruende, mail: 'kein-empfaenger', werte: w };
+  let alt = null;
+  try {
+    const z = await db.prepare('SELECT wert FROM waechter_stand WHERE schluessel = ?').bind('letzte_mail').first();
+    alt = z ? z.wert : null;
+  } catch (e) {
+    /* Ohne die Tabelle gäbe es keine Bremse (alle 15 Minuten eine Mail), also wird nichts gesendet. */
+    if (fehltTabelle(e)) return { geprueft: true, warnung: true, gruende, mail: 'fehlgeschlagen', werte: w };
+    throw e;
+  }
+  if (alt !== null && jetzt - alt < WAECHTER_MAIL_ABSTAND) return { geprueft: true, warnung: true, gruende, mail: 'gedrosselt', werte: w };
+  /* Erst die Zeit eintragen, dann senden: Schlägt das Senden fehl, wird der alte Wert zurückgesetzt. */
+  await db.prepare('INSERT OR REPLACE INTO waechter_stand (schluessel, wert) VALUES (?, ?)').bind('letzte_mail', jetzt).run();
+  try {
+    await mailSenden(env, an, 'MobiMory Kosten-Wächter: Warnung', waechterText(w, gruende));
+  } catch (e) {
+    try {
+      if (alt === null) await db.prepare('DELETE FROM waechter_stand WHERE schluessel = ?').bind('letzte_mail').run();
+      else await db.prepare('INSERT OR REPLACE INTO waechter_stand (schluessel, wert) VALUES (?, ?)').bind('letzte_mail', alt).run();
+    } catch (e2) { /* nächster Lauf */ }
+    return { geprueft: true, warnung: true, gruende, mail: 'fehlgeschlagen', werte: w };
+  }
+  return { geprueft: true, warnung: true, gruende, mail: 'gesendet', werte: w };
+}
+
 export default {
-  fetch(request, env) { return behandeln(request, env); }
+  fetch(request, env) { return behandeln(request, env); },
+  /* Cron-Auslöser (wrangler-konto.jsonc, alle 15 Minuten): der Kosten-Wächter. Fehler stören nichts anderes, sie stehen im Protokoll. */
+  scheduled(event, env, ctx) {
+    const lauf = waechterPruefen(env, datenbank(env), Date.now()).then((r) => {
+      console.log('Kosten-Wächter: geprüft=' + r.geprueft + ' Warnung=' + r.warnung + ' Gründe=' + r.gruende.join(',') + ' Mail=' + r.mail);
+    }).catch((e) => { console.log('Kosten-Wächter: Fehler ' + String(e && e.message || e)); });
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(lauf);
+    return lauf;
+  }
 };

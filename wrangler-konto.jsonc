@@ -15,6 +15,8 @@
     "ERLAUBTE_URSPRUENGE": "https://app.mobimory.com",
     "ABSENDER": "konto@mobimory.com"
   },
+  // Kosten-Wächter (seit 2.0.71, Dienst 13e-3): läuft alle 15 Minuten. Empfänger und Schwellen stehen als Variablen im Dashboard (siehe server/EINRICHTUNG.md).
+  "triggers": { "crons": ["*/15 * * * *"] },
   "send_email": [
     { "name": "EMAIL" }
   ],
