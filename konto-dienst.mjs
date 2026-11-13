@@ -35,10 +35,14 @@
  *      zu den Einnahmen zu hoch werden oder ob zu viele neue Testwochen entstehen, und schickt dann höchstens eine Mail pro Stunde (nur Zahlen, keine Namen).
  *      Eine weitere Tabelle „waechter_stand“ (schema.sql, 13e-3.sql). Nötig dafür: Variable WAECHTER_EMAIL (Empfänger). Alle Schwellen und Preise sind
  *      Variablen mit Standardwerten (siehe „Kosten-Wächter“ weiter unten).
+ * 13e-4 (seit 2.0.72): Bezahlung. Zwei Wege: PayPal (der Dienst legt die Bestellung bei PayPal an, nach dem Bezahlen schließt er sie ab und schaltet sofort frei)
+ *      und Überweisung (Bestellung mit Verwendungszweck, der Betreiber schaltet nach Geldeingang auf der Seite /freischalten frei). Nur Jahreszahlung
+ *      (Mittel, Voll), kein Abo, dazu Blöcke zu 5 zusätzlichen Online-Recherchen. Je Zahlung ein Beleg per Mail. Erinnerung 30 und 7 Tage vor dem Ablauf.
+ *      Sechs weitere Tabellen (schema.sql, 13e-4.sql). Variablen und Geheimnisse siehe server/EINRICHTUNG.md (PAYPAL_*, UEBERWEISUNG_*, FREISCHALT_TOKEN, BELEG_*).
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13e-3';
+export const VERSION = '13e-4';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -221,6 +225,7 @@ async function aufraeumen(db, jetzt) {
   ]);
   await freigabenAufraeumen(db, jetzt);
   await checksAufraeumen(db, jetzt);
+  await bestellungenAufraeumen(db, jetzt);
 }
 
 /* ---------- E-Mail ---------- */
@@ -1017,6 +1022,10 @@ async function gesundheit(env) {
   try { const db = datenbank(env); await db.prepare('SELECT 1 FROM stufe_konto LIMIT 1').first(); await db.prepare('SELECT 1 FROM testwoche LIMIT 1').first(); await db.prepare('SELECT 1 FROM check_nutzung LIMIT 1').first(); await db.prepare('SELECT 1 FROM check_ergebnis LIMIT 1').first(); stufen = true; } catch (e) { stufen = false; }
   let waechter = false;
   try { await datenbank(env).prepare('SELECT 1 FROM waechter_stand LIMIT 1').first(); waechter = !!(env && env.EMAIL && env.ABSENDER && waechterEmpfaenger(env)); } catch (e) { waechter = false; }
+  /* Bezahlung (13e-4): die Tabellen und was im Worker eingetragen ist. Es steht nur „ja“ oder „nein“ da, nie ein Wert. */
+  let bezTabellen = false;
+  try { const db = datenbank(env); for (const t of ['bestellung', 'beleg', 'check_extra', 'erinnerung', 'zaehler']) await db.prepare('SELECT 1 FROM ' + t + ' LIMIT 1').first(); bezTabellen = true; } catch (e) { bezTabellen = false; }
+  const bezahlung = { tabellen: bezTabellen, paypal: paypalEingerichtet(env), paypalEchtgeld: !!(env && env.PAYPAL_LIVE === '1'), ueberweisung: !!ueberweisungDaten(env), freischalten: !!adminToken(env), beleg: !!belegAnschrift(env) };
   return {
     ok: true, dienst: DIENST, version: VERSION,
     datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, waechter,
@@ -1024,6 +1033,7 @@ async function gesundheit(env) {
     pepper: typeof (env && env.PASSWORT_PEPPER) === 'string' && env.PASSWORT_PEPPER.length >= 32,
     mail: !!(env && env.EMAIL && env.ABSENDER),
     speicher: !!(env && env.DATEN),
+    bezahlung: bezahlung,
     entwicklung: !!(env && env.ENTWICKLUNG === '1')
   };
 }
@@ -1092,6 +1102,23 @@ async function checksGenutzt(db, dr, stufeId, jetzt) {
   return z ? z.n : 0;
 }
 
+/* Nachgekaufte Recherchen (seit 2.0.72): Tabelle check_extra. Fehlt sie noch, gibt es keine. */
+async function extraFrei(db, nutzerId) {
+  try {
+    const z = await db.prepare('SELECT anzahl FROM check_extra WHERE nutzer_id = ?').bind(nutzerId).first();
+    return z ? z.anzahl : 0;
+  } catch (e) { if (fehltTabelle(e)) return 0; throw e; }
+}
+async function extraNehmen(db, nutzerId) {
+  try {
+    const r = await db.prepare('UPDATE check_extra SET anzahl = anzahl - 1 WHERE nutzer_id = ? AND anzahl > 0').bind(nutzerId).run();
+    return !!(r && r.meta && r.meta.changes === 1);
+  } catch (e) { if (fehltTabelle(e)) return false; throw e; }
+}
+async function extraZurueck(db, nutzerId) {
+  try { await db.prepare('UPDATE check_extra SET anzahl = anzahl + 1 WHERE nutzer_id = ?').bind(nutzerId).run(); } catch (e) { /* nächster Versuch beim Support */ }
+}
+
 async function kontoStufe(request, env, db, jetzt) {
   const a = await authentifizieren(request, db, jetzt);
   const st = await stufeVon(db, a.id, jetzt, false);
@@ -1102,7 +1129,7 @@ async function kontoStufe(request, env, db, jetzt) {
     ok: true,
     stufe: { id: st.id, name: st.name, bis: st.bis },
     grenzen: { geraete: g.geraete, checks: g.checks, fahrzeuge: g.fahrzeuge, online: g.online },
-    nutzung: { geraete: geraete ? geraete.n : 0, checks: genutzt, checksFrei: g.checks === null ? null : Math.max(0, g.checks - genutzt), zeitraumTage: CHECK_ZEITRAUM_TAGE }
+    nutzung: { geraete: geraete ? geraete.n : 0, checks: genutzt, checksFrei: g.checks === null ? null : Math.max(0, g.checks - genutzt), zeitraumTage: CHECK_ZEITRAUM_TAGE, extra: await extraFrei(db, a.id) }
   };
 }
 
@@ -1142,12 +1169,22 @@ async function checkSenden(request, env, db, jetzt, optionen) {
 
   await bremsen(db, await schluesselFuer('chk', a.datenraumId), 8, 10 * MINUTE, jetzt, 'Es wurden zu viele Checks hintereinander gestartet.');
   const genutzt = await checksGenutzt(db, a.datenraumId, st.id, jetzt);
+  /* Ist das Kontingent der Stufe aufgebraucht, werden nachgekaufte Recherchen benutzt (seit 2.0.72). Sie zählen nicht zum Kontingent (Stufe „extra“). */
+  let extraGenommen = false;
   if (st.grenzen.checks !== null && genutzt >= st.grenzen.checks) {
-    throw new HttpFehler(402, 'Dein Kontingent ist aufgebraucht: ' + genutzt + ' von ' + st.grenzen.checks + ' Online-Checks in den letzten 12 Monaten. Ein gespeicherter Check zählt nicht.', { genutzt, grenze: st.grenzen.checks, stufe: st.id });
+    extraGenommen = await extraNehmen(db, a.id);
+    if (!extraGenommen) {
+      throw new HttpFehler(402, 'Dein Kontingent ist aufgebraucht: ' + genutzt + ' von ' + st.grenzen.checks + ' Online-Checks in den letzten 12 Monaten. Ein gespeicherter Check zählt nicht. Unter Konto kannst du 5 zusätzliche Recherchen kaufen.', { genutzt, grenze: st.grenzen.checks, stufe: st.id });
+    }
   }
   const nid = crypto.randomUUID();
-  await db.prepare('INSERT INTO check_nutzung (id, datenraum_id, art, stufe, am, status) VALUES (?, ?, ?, ?, ?, ?)').bind(nid, a.datenraumId, art, st.id, jetzt, 'laeuft').run();
-  async function zurueck() { try { await db.prepare('DELETE FROM check_nutzung WHERE id = ?').bind(nid).run(); } catch (e) { /* wird später aufgeräumt */ } }
+  try {
+    await db.prepare('INSERT INTO check_nutzung (id, datenraum_id, art, stufe, am, status) VALUES (?, ?, ?, ?, ?, ?)').bind(nid, a.datenraumId, art, extraGenommen ? 'extra' : st.id, jetzt, 'laeuft').run();
+  } catch (e) { if (extraGenommen) await extraZurueck(db, a.id); throw e; }
+  async function zurueck() {
+    try { await db.prepare('DELETE FROM check_nutzung WHERE id = ?').bind(nid).run(); } catch (e) { /* wird später aufgeräumt */ }
+    if (extraGenommen) await extraZurueck(db, a.id);
+  }
 
   const holen = (optionen && optionen.fetch) || fetch;
   let r, text;
@@ -1178,7 +1215,9 @@ async function checkSenden(request, env, db, jetzt, optionen) {
   if (roh.length <= MAX_CHECK_ERGEBNIS) {
     await db.prepare('INSERT INTO check_ergebnis (schluessel, art, antwort, erstellt_am) VALUES (?, ?, ?, ?) ON CONFLICT(schluessel) DO UPDATE SET antwort = excluded.antwort, erstellt_am = excluded.erstellt_am').bind(schluessel, art, roh, jetzt).run();
   }
-  return { ok: true, gespeichert: false, antwort, kontingent: { genutzt: genutzt + 1, grenze: st.grenzen.checks, stufe: st.id } };
+  const kontingent = { genutzt: extraGenommen ? genutzt : genutzt + 1, grenze: st.grenzen.checks, stufe: st.id };
+  if (extraGenommen) kontingent.extraFrei = await extraFrei(db, a.id);
+  return { ok: true, gespeichert: false, antwort, kontingent };
 }
 
 /* ---------- Anfrage → Antwort ---------- */
@@ -1201,7 +1240,8 @@ export async function behandeln(request, env, optionen) {
   const url = new URL(request.url);
   const ursprung = request.headers.get('Origin');
   let cors = null;
-  if (ursprung) {
+  /* Die Freischalt-Seite des Betreibers ruft den Dienst von seiner eigenen Adresse aus auf: gleicher Ursprung, keine Kopfzeilen nötig. */
+  if (ursprung && ursprung !== url.origin) {
     /* Die Ablehnung trägt die Kopfzeile für diese Adresse, damit die App „abgelehnt“ von „keine Verbindung“ unterscheiden kann. Sie enthält nur den Fehlertext. */
     if (!erlaubteUrspruenge(env).includes(ursprung)) return antwort(403, { ok: false, error: 'Diese App-Adresse ist beim Dienst nicht erlaubt.' }, { 'Access-Control-Allow-Origin': ursprung, 'Vary': 'Origin' });
     cors = { 'Access-Control-Allow-Origin': ursprung, 'Vary': 'Origin', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS', 'Access-Control-Expose-Headers': 'X-Verschluesselt', 'Access-Control-Max-Age': '600' };
@@ -1245,7 +1285,16 @@ export async function behandeln(request, env, optionen) {
       'GET /kontrolle/lesen': kontrolleLesen,
       'GET /kontrolle/datei': kontrolleDatei,
       'GET /konto/stufe': kontoStufe,
-      'POST /check/senden': checkSenden
+      'POST /check/senden': checkSenden,
+      'POST /bezahlen/starten': bezahlenStarten,
+      'GET /bezahlen/paypal/zurueck': paypalZurueck,
+      'GET /bezahlen/paypal/abbruch': paypalAbbruch,
+      'GET /bezahlen/verlaengern': verlaengernLink,
+      'GET /freischalten': freischaltSeite,
+      'POST /freischalten/liste': freischaltListe,
+      'POST /freischalten/bestaetigen': freischaltBestaetigen,
+      'POST /freischalten/direkt': freischaltDirekt,
+      'POST /freischalten/loeschen': freischaltLoeschen
     };
     const f = wege[weg];
     if (!f) return antwort(404, { ok: false, error: 'Diese Adresse gibt es beim Dienst nicht.' }, cors);
@@ -1261,11 +1310,384 @@ export async function behandeln(request, env, optionen) {
   }
 }
 
+/* ---------- 13e-4: Bezahlung (seit 2.0.72) ---------- */
+
+/* Festlegung des Nutzers (12.11.2026): nur Jahreszahlung (12 × 4,99 € und 12 × 9,99 €), kein Abo, keine automatische Abbuchung.
+   Zusätzliche Online-Recherchen nur in Blöcken zu 5 für 9,99 €. Die Preise stehen nur hier und in js/konto.js (ein Test vergleicht beide).
+   Der Dienst speichert nur Stufe und Ablaufdatum, Zahlungsdaten bekommt er nie zu sehen. Für die Buchhaltung gibt es je Zahlung eine Zeile
+   in „beleg“ (Nummer, Datum, Adresse, Leistung, Betrag), die auch nach dem Löschen eines Kontos bleibt. */
+export const PRODUKTE = {
+  mittel: { name: 'MobiMory Mittel, Nutzung für ein Jahr', kurz: 'Mittel (ein Jahr)', cent: 5988, art: 'stufe', stufe: 'mittel' },
+  voll: { name: 'MobiMory Voll, Nutzung für ein Jahr', kurz: 'Voll (ein Jahr)', cent: 11988, art: 'stufe', stufe: 'voll' },
+  recherche5: { name: '5 zusätzliche Online-Recherchen', kurz: '5 Recherchen', cent: 999, art: 'checks', anzahl: 5 }
+};
+const ERINNERUNG_TAGE = [30, 7];
+const LINK_TAGE = 45;
+const PAYPAL_BESTELLUNG_TAGE = 3;
+const UEBERWEISUNG_BESTELLUNG_TAGE = 60;
+const MAX_OFFENE_UEBERWEISUNGEN = 5;
+const DIENST_URL_STANDARD = 'https://konto.mobimory.com';
+
+function dienstUrl(env) {
+  const u = env && typeof env.DIENST_URL === 'string' ? env.DIENST_URL.trim().replace(/\/+$/, '') : '';
+  return /^https:\/\/[^\s/]+$/.test(u) ? u : DIENST_URL_STANDARD;
+}
+function appUrl(env) { return erlaubteUrspruenge(env)[0] || ''; }
+function datumDe(ms) { const d = new Date(ms); return String(d.getUTCDate()).padStart(2, '0') + '.' + String(d.getUTCMonth() + 1).padStart(2, '0') + '.' + d.getUTCFullYear(); }
+function plusJahr(ms) { const d = new Date(ms); d.setUTCFullYear(d.getUTCFullYear() + 1); return d.getTime(); }
+function centText(cent) { return euroText(cent / 100); }
+function centWert(cent) { return (cent / 100).toFixed(2); }
+
+function produktVon(roh) {
+  const id = typeof roh === 'string' ? roh : '';
+  if (!Object.prototype.hasOwnProperty.call(PRODUKTE, id)) throw new HttpFehler(400, 'Dieses Angebot gibt es nicht.', { feld: 'produkt' });
+  return { id, p: PRODUKTE[id] };
+}
+
+function paypalEingerichtet(env) {
+  return !!(env && typeof env.PAYPAL_CLIENT_ID === 'string' && env.PAYPAL_CLIENT_ID.length > 5 && typeof env.PAYPAL_SECRET === 'string' && env.PAYPAL_SECRET.length > 5);
+}
+function paypalBasis(env) { return env && env.PAYPAL_LIVE === '1' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com'; }
+function ueberweisungDaten(env) {
+  const t = (n) => (env && typeof env[n] === 'string' ? env[n].trim() : '');
+  const iban = t('UEBERWEISUNG_IBAN').replace(/\s+/g, '');
+  const inhaber = t('UEBERWEISUNG_INHABER');
+  if (iban.length < 15 || !inhaber) return null;
+  return { inhaber, iban, bic: t('UEBERWEISUNG_BIC') };
+}
+function adminToken(env) { return env && typeof env.FREISCHALT_TOKEN === 'string' && env.FREISCHALT_TOKEN.length >= 20 ? env.FREISCHALT_TOKEN : ''; }
+function belegAnschrift(env) { return env && typeof env.BELEG_ANSCHRIFT === 'string' && env.BELEG_ANSCHRIFT.trim() ? env.BELEG_ANSCHRIFT.trim() : ''; }
+
+async function paypalToken(env, holen) {
+  const basic = btoa(env.PAYPAL_CLIENT_ID + ':' + env.PAYPAL_SECRET);
+  let r, j = null;
+  try {
+    r = await holen(paypalBasis(env) + '/v1/oauth2/token', { method: 'POST', headers: { Authorization: 'Basic ' + basic, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=client_credentials' });
+    j = await r.json();
+  } catch (e) { throw new HttpFehler(502, 'PayPal ist gerade nicht erreichbar. Bitte später noch einmal versuchen.'); }
+  if (!r.ok || !j || typeof j.access_token !== 'string') throw new HttpFehler(502, 'PayPal hat die Anmeldung des Dienstes abgelehnt.');
+  return j.access_token;
+}
+
+/* Was ist erlaubt zu kaufen? Das Entwickler-Konto nie, Mittel nicht bei laufendem Voll, Recherchen nur mit Online-Stufe. */
+async function bestellPruefen(db, nutzerId, produktId, jetzt) {
+  const st = await stufeVon(db, nutzerId, jetzt, false);
+  if (st.id === 'entwickler') throw new HttpFehler(400, 'Dieses Konto hat die Stufe Entwickler und braucht nichts zu kaufen.');
+  const p = PRODUKTE[produktId];
+  if (p.art === 'stufe' && p.stufe === 'mittel' && st.id === 'voll') throw new HttpFehler(400, 'Du hast bereits Voll' + (st.bis ? ' (bis ' + datumDe(st.bis) + ')' : '') + '. Mittel kannst du nach dem Ablauf kaufen.');
+  if (p.art === 'checks' && !st.grenzen.online) throw new HttpFehler(400, 'Zusätzliche Recherchen gibt es ab der Stufe Mittel oder in der Testwoche.');
+  return st;
+}
+
+async function bestellungAnlegen(db, nutzer, produktId, weg, jetzt) {
+  const p = PRODUKTE[produktId];
+  const id = 'MM-' + zufallCode(8);
+  await db.prepare('INSERT INTO bestellung (id, nutzer_id, email, produkt, cent, weg, paypal_id, erstellt_am) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)').bind(id, nutzer.id, nutzer.email, produktId, p.cent, weg, jetzt).run();
+  return id;
+}
+
+/* Legt bei PayPal eine Bestellung an und gibt die Adresse zurück, zu der der Kunde zum Bezahlen geht. */
+async function paypalBestellen(env, db, nutzer, produktId, jetzt, optionen) {
+  if (!paypalEingerichtet(env)) throw new HttpFehler(503, 'Das Bezahlen mit PayPal ist im Dienst noch nicht eingerichtet.');
+  await bestellPruefen(db, nutzer.id, produktId, jetzt);
+  await bremsen(db, await schluesselFuer('bez', nutzer.id), 10, 60 * MINUTE, jetzt, 'Es wurden zu viele Bestellungen hintereinander angelegt.');
+  const holen = (optionen && optionen.fetch) || fetch;
+  const token = await paypalToken(env, holen);
+  const p = PRODUKTE[produktId];
+  const bid = await bestellungAnlegen(db, nutzer, produktId, 'paypal', jetzt);
+  async function weg() { try { await db.prepare('DELETE FROM bestellung WHERE id = ?').bind(bid).run(); } catch (e) { /* wird später aufgeräumt */ } }
+  let r, j = null;
+  try {
+    r = await holen(paypalBasis(env) + '/v2/checkout/orders', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', 'PayPal-Request-Id': bid },
+      body: JSON.stringify({
+        intent: 'CAPTURE',
+        purchase_units: [{ reference_id: bid, custom_id: bid, description: p.name, amount: { currency_code: 'EUR', value: centWert(p.cent) } }],
+        payment_source: { paypal: { experience_context: {
+          brand_name: 'MobiMory', locale: 'de-DE', landing_page: 'LOGIN', shipping_preference: 'NO_SHIPPING', user_action: 'PAY_NOW',
+          payment_method_preference: 'IMMEDIATE_PAYMENT_REQUIRED',
+          return_url: dienstUrl(env) + '/bezahlen/paypal/zurueck?b=' + bid,
+          cancel_url: dienstUrl(env) + '/bezahlen/paypal/abbruch'
+        } } }
+      })
+    });
+    j = await r.json();
+  } catch (e) { await weg(); throw new HttpFehler(502, 'PayPal ist gerade nicht erreichbar. Bitte später noch einmal versuchen.'); }
+  const link = j && Array.isArray(j.links) ? j.links.find((l) => l && (l.rel === 'payer-action' || l.rel === 'approve')) : null;
+  if (!r.ok || !j || typeof j.id !== 'string' || !link || !/^https:\/\//.test(link.href || '')) { await weg(); throw new HttpFehler(502, 'PayPal hat die Bestellung nicht angenommen.'); }
+  await db.prepare('UPDATE bestellung SET paypal_id = ? WHERE id = ?').bind(j.id, bid).run();
+  return { url: link.href, referenz: bid };
+}
+
+/* Verbucht eine bezahlte Bestellung: Beleg, Stufe oder Recherchen, Mail. Ein zweiter Aufruf mit derselben Referenz tut nichts. */
+async function bestellungAbschliessen(env, db, best, weg, referenz, jetzt) {
+  const alt = await db.prepare('SELECT nummer FROM beleg WHERE referenz = ?').bind(referenz).first();
+  if (alt) { await db.prepare('DELETE FROM bestellung WHERE id = ?').bind(best.id).run(); return { nummer: alt.nummer, neu: false, bis: null }; }
+  const p = PRODUKTE[best.produkt];
+  if (!p) throw new HttpFehler(400, 'Dieses Angebot gibt es nicht.');
+  const jahr = new Date(jetzt).getUTCFullYear();
+  const z = await db.prepare('INSERT INTO zaehler (schluessel, wert) VALUES (?, 1) ON CONFLICT(schluessel) DO UPDATE SET wert = wert + 1 RETURNING wert').bind('beleg:' + jahr).first();
+  const nummer = 'MM-' + jahr + '-' + String(z.wert).padStart(4, '0');
+  const liste = [db.prepare('INSERT INTO beleg (nummer, am, email, produkt, cent, weg, referenz) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(nummer, jetzt, best.email, best.produkt, best.cent, weg, referenz)];
+  let bis = null;
+  if (p.art === 'stufe') {
+    const s = await db.prepare('SELECT stufe, gueltig_bis FROM stufe_konto WHERE nutzer_id = ?').bind(best.nutzer_id).first();
+    if (!s || s.stufe !== 'entwickler') {
+      const verlaengern = s && s.stufe === p.stufe && s.gueltig_bis !== null && s.gueltig_bis > jetzt;
+      bis = plusJahr(verlaengern ? s.gueltig_bis : jetzt);
+      liste.push(db.prepare('INSERT OR REPLACE INTO stufe_konto (nutzer_id, stufe, gueltig_bis, geaendert_am) VALUES (?, ?, ?, ?)').bind(best.nutzer_id, p.stufe, bis, jetzt));
+    }
+  } else {
+    liste.push(db.prepare('INSERT INTO check_extra (nutzer_id, anzahl) VALUES (?, ?) ON CONFLICT(nutzer_id) DO UPDATE SET anzahl = anzahl + excluded.anzahl').bind(best.nutzer_id, p.anzahl));
+  }
+  liste.push(db.prepare('DELETE FROM bestellung WHERE id = ?').bind(best.id));
+  await db.batch(liste);
+  try { await belegSenden(env, { nummer, am: jetzt, email: best.email, produkt: best.produkt, cent: best.cent, weg, referenz, bis }); } catch (e) { console.log('Beleg-Mail nicht gesendet: ' + String(e && e.message || e)); }
+  return { nummer, neu: true, bis };
+}
+
+function belegText(b) {
+  const p = PRODUKTE[b.produkt];
+  const z = [];
+  z.push('Beleg (Rechnung) Nr. ' + b.nummer + '\nDatum: ' + datumDe(b.am));
+  z.push('Leistender:\n' + (belegAnschrift(b.env) || 'Ralph Hasslacher, 74372 Sersheim'));
+  z.push('Empfänger: ' + b.email);
+  z.push('Leistung: ' + p.name + (p.art === 'stufe' && b.bis ? ' (Zeitraum ' + datumDe(b.am) + ' bis ' + datumDe(b.bis) + ')' : ' (Leistungszeitpunkt ' + datumDe(b.am) + ')') + '\nBetrag: ' + centText(b.cent) + '\nBezahlt per ' + (b.weg === 'paypal' ? 'PayPal' : 'Überweisung') + ', Zahlungsreferenz ' + b.referenz);
+  z.push('Gemäß § 19 UStG wird keine Umsatzsteuer berechnet.');
+  if (p.art === 'stufe') z.push('Deine Stufe ' + p.stufe.charAt(0).toUpperCase() + p.stufe.slice(1) + (b.bis ? ' gilt jetzt bis ' + datumDe(b.bis) : ' ist freigeschaltet') + '. Es ist kein Abo: Es wird nichts automatisch abgebucht. Vor dem Ablauf bekommst du eine Erinnerung.');
+  else z.push('Die ' + p.anzahl + ' Recherchen sind deinem Konto gutgeschrieben. Sie werden benutzt, wenn dein Kontingent aufgebraucht ist.');
+  z.push('Bitte hebe diese Mail als Beleg auf.');
+  return z.join('\n\n');
+}
+
+async function belegSenden(env, b) {
+  const text = belegText(Object.assign({ env }, b));
+  await mailSenden(env, b.email, 'Dein Beleg Nr. ' + b.nummer + ' – MobiMory', text);
+  const kopie = env && typeof env.BELEG_KOPIE === 'string' ? env.BELEG_KOPIE.trim() : '';
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(kopie)) { try { await mailSenden(env, kopie, 'Kopie Beleg ' + b.nummer, text); } catch (e) { /* die Kopie ist nur eine Hilfe */ } }
+}
+
+/* ---------- die Wege ---------- */
+
+const SEITE_KOPF = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" };
+function kleineSeite(titel, text, status, link) {
+  const a = link && /^https:\/\//.test(link.url) ? '<p><a href="' + htmlSauber(link.url).replace(/"/g, '&quot;') + '">' + htmlSauber(link.text) + '</a></p>' : '';
+  const html = '<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>' + htmlSauber(titel) + '</title>'
+    + '<style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:2rem auto;padding:0 1rem;line-height:1.5}a{font-size:1.2rem}</style></head><body><h1>' + htmlSauber(titel) + '</h1><p>' + htmlSauber(text) + '</p>' + a + '</body></html>';
+  return new Response(html, { status: status || 200, headers: SEITE_KOPF });
+}
+
+/* App: Bezahlen starten. weg = „paypal“ (Antwort mit Adresse) oder „ueberweisung“ (Antwort mit Bankdaten und Verwendungszweck). */
+async function bezahlenStarten(request, env, db, jetzt, optionen) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request, MAX_BODY);
+  const { id, p } = produktVon(b.produkt);
+  const weg = b.weg === 'ueberweisung' ? 'ueberweisung' : (b.weg === 'paypal' ? 'paypal' : '');
+  if (!weg) throw new HttpFehler(400, 'Der Zahlungsweg fehlt oder ist unbekannt.', { feld: 'weg' });
+  if (weg === 'paypal') {
+    const r = await paypalBestellen(env, db, { id: a.id, email: a.email }, id, jetzt, optionen);
+    return { ok: true, weg, produkt: id, betrag: centText(p.cent), url: r.url };
+  }
+  const bank = ueberweisungDaten(env);
+  if (!bank) throw new HttpFehler(503, 'Die Überweisung ist im Dienst noch nicht eingerichtet.');
+  await bestellPruefen(db, a.id, id, jetzt);
+  await bremsen(db, await schluesselFuer('bez', a.id), 10, 60 * MINUTE, jetzt, 'Es wurden zu viele Bestellungen hintereinander angelegt.');
+  const offen = await db.prepare("SELECT COUNT(*) AS n FROM bestellung WHERE nutzer_id = ? AND weg = 'ueberweisung'").bind(a.id).first();
+  if (offen && offen.n >= MAX_OFFENE_UEBERWEISUNGEN) throw new HttpFehler(400, 'Es warten schon ' + MAX_OFFENE_UEBERWEISUNGEN + ' Überweisungen auf Geldeingang. Bitte warte, bis sie verbucht sind.');
+  const ref = await bestellungAnlegen(db, { id: a.id, email: a.email }, id, 'ueberweisung', jetzt);
+  const text = 'Du hast ' + p.name + ' für ' + centText(p.cent) + ' bestellt. Bitte überweise den Betrag:\n\n'
+    + 'Empfänger: ' + bank.inhaber + '\nIBAN: ' + bank.iban + (bank.bic ? '\nBIC: ' + bank.bic : '') + '\nBetrag: ' + centText(p.cent) + '\nVerwendungszweck: ' + ref
+    + '\n\nBitte genau diesen Verwendungszweck angeben, damit die Zahlung zugeordnet wird. Nach Geldeingang wird dein Konto freigeschaltet, du bekommst dann eine Mail mit dem Beleg. Es ist kein Abo, es wird nichts abgebucht.';
+  let mail = false;
+  try { await mailSenden(env, a.email, 'Deine Überweisung an MobiMory (' + ref + ')', text); mail = true; } catch (e) { mail = false; }
+  return { ok: true, weg, produkt: id, betrag: centText(p.cent), referenz: ref, empfaenger: bank.inhaber, iban: bank.iban, bic: bank.bic, verwendungszweck: ref, mail };
+}
+
+/* PayPal schickt den Kunden nach dem Bezahlen hierher zurück: Die Zahlung wird abgeschlossen (capture) und die Stufe gesetzt. */
+async function paypalZurueck(request, env, db, jetzt, optionen) {
+  const bid = (new URL(request.url).searchParams.get('b') || '').toUpperCase();
+  const app = appUrl(env) ? { url: appUrl(env), text: 'Zurück zur App' } : null;
+  if (!/^MM-[A-Z0-9]{8}$/.test(bid)) return kleineSeite('Unbekannte Bestellung', 'Diese Adresse gehört zu keiner Bestellung.', 404, app);
+  const best = await db.prepare("SELECT id, nutzer_id, email, produkt, cent, paypal_id FROM bestellung WHERE id = ? AND weg = 'paypal'").bind(bid).first();
+  if (!best || !best.paypal_id) return kleineSeite('Schon verbucht', 'Diese Zahlung ist schon verbucht oder die Bestellung gibt es nicht mehr. Öffne die App: Unter Konto siehst du deine Stufe.', 200, app);
+  const holen = (optionen && optionen.fetch) || fetch;
+  const token = await paypalToken(env, holen);
+  const kopf = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
+  let order = null;
+  try {
+    const r = await holen(paypalBasis(env) + '/v2/checkout/orders/' + encodeURIComponent(best.paypal_id) + '/capture', { method: 'POST', headers: Object.assign({ 'PayPal-Request-Id': best.id + '-capture' }, kopf), body: '{}' });
+    let j = null;
+    try { j = await r.json(); } catch (e) { j = null; }
+    if (r.ok) order = j;
+    else if (/ORDER_ALREADY_CAPTURED/.test(JSON.stringify(j || {}))) {
+      const g = await holen(paypalBasis(env) + '/v2/checkout/orders/' + encodeURIComponent(best.paypal_id), { method: 'GET', headers: kopf });
+      order = g.ok ? await g.json() : null;
+    }
+  } catch (e) { order = null; }
+  const pu = order && Array.isArray(order.purchase_units) ? order.purchase_units[0] : null;
+  const cap = pu && pu.payments && Array.isArray(pu.payments.captures) ? pu.payments.captures[0] : null;
+  if (!order || order.status !== 'COMPLETED' || !cap || cap.status !== 'COMPLETED' || typeof cap.id !== 'string') {
+    return kleineSeite('Zahlung nicht abgeschlossen', 'Die Zahlung ist bei PayPal nicht abgeschlossen worden. Es wurde nichts abgebucht oder sie ist noch in Prüfung. Du kannst es in der App noch einmal versuchen.', 200, app);
+  }
+  if (!cap.amount || cap.amount.currency_code !== 'EUR' || cap.amount.value !== centWert(best.cent)) {
+    console.log('Bezahlung: Betrag passt nicht, Bestellung ' + best.id);
+    return kleineSeite('Betrag stimmt nicht', 'Der bezahlte Betrag passt nicht zur Bestellung. Das Konto wurde nicht freigeschaltet. Bitte melde dich beim Betreiber (info@mobimory.com) und nenne die Bestellnummer ' + best.id + '.', 200, app);
+  }
+  const erg = await bestellungAbschliessen(env, db, best, 'paypal', cap.id, jetzt);
+  return kleineSeite('Danke, die Zahlung ist angekommen', 'Dein Konto ist freigeschaltet' + (erg.bis ? ' bis ' + datumDe(erg.bis) : '') + '. Der Beleg ' + erg.nummer + ' kommt per E-Mail. Öffne die App, unter Konto siehst du die neue Stufe.', 200, app);
+}
+
+async function paypalAbbruch(request, env) {
+  const app = appUrl(env) ? { url: appUrl(env), text: 'Zurück zur App' } : null;
+  return kleineSeite('Bezahlen abgebrochen', 'Du hast das Bezahlen abgebrochen. Es wurde nichts abgebucht.', 200, app);
+}
+
+/* Link aus der Erinnerungsmail: gehört zu einem Konto und einem Angebot, gilt 45 Tage, legt die PayPal-Bestellung an und leitet weiter. */
+async function linkToken(env, nutzerId, produktId, bis) {
+  const teil = zuBase64Url(kodieren.encode(nutzerId + '|' + produktId + '|' + bis));
+  return teil + '.' + zuHex(await hmac(pepper(env), 'zahllink:' + teil));
+}
+async function verlaengernLink(request, env, db, jetzt, optionen) {
+  const t = new URL(request.url).searchParams.get('t') || '';
+  const m = /^([A-Za-z0-9_-]{10,300})\.([0-9a-f]{64})$/.exec(t);
+  const app = appUrl(env) ? { url: appUrl(env), text: 'Zur App' } : null;
+  if (!m) return kleineSeite('Link ungültig', 'Dieser Link ist ungültig. Öffne die App, dort kannst du unter Konto bezahlen.', 400, app);
+  const soll = await hmac(pepper(env), 'zahllink:' + m[1]);
+  const ist = new Uint8Array(m[2].match(/../g).map((x) => parseInt(x, 16)));
+  if (!gleich(soll, ist)) return kleineSeite('Link ungültig', 'Dieser Link ist ungültig. Öffne die App, dort kannst du unter Konto bezahlen.', 400, app);
+  const teile = new TextDecoder().decode(ausBase64Url(m[1])).split('|');
+  const bis = Number(teile[2]);
+  if (teile.length !== 3 || !Number.isFinite(bis) || bis < jetzt) return kleineSeite('Link abgelaufen', 'Dieser Link gilt nicht mehr. Öffne die App, dort kannst du unter Konto bezahlen.', 400, app);
+  const n = await db.prepare('SELECT id, email FROM nutzer WHERE id = ?').bind(teile[0]).first();
+  if (!n || !Object.prototype.hasOwnProperty.call(PRODUKTE, teile[1])) return kleineSeite('Link ungültig', 'Dieser Link gehört zu keinem Konto mehr.', 400, app);
+  try {
+    const r = await paypalBestellen(env, db, n, teile[1], jetzt, optionen);
+    return new Response(null, { status: 302, headers: { Location: r.url, 'Cache-Control': 'no-store' } });
+  } catch (e) {
+    if (e instanceof HttpFehler) return kleineSeite('Bezahlen gerade nicht möglich', e.message, 200, app);
+    throw e;
+  }
+}
+
+/* Erinnerung vor dem Ablauf: je Konto und Ablaufdatum eine Mail bei 30 und eine bei 7 Tagen (nie beide auf einmal). Läuft im Cron-Auslöser mit. */
+export async function erinnerungenSenden(env, db, jetzt) {
+  const ergebnis = { gesendet: 0, fehler: 0 };
+  let zeilen;
+  try {
+    zeilen = await db.prepare("SELECT s.nutzer_id AS nutzer_id, s.stufe AS stufe, s.gueltig_bis AS bis, n.email AS email FROM stufe_konto s JOIN nutzer n ON n.id = s.nutzer_id WHERE s.stufe IN ('mittel', 'voll') AND s.gueltig_bis IS NOT NULL AND s.gueltig_bis > ? AND s.gueltig_bis <= ? ORDER BY s.gueltig_bis LIMIT 50")
+      .bind(jetzt, jetzt + ERINNERUNG_TAGE[0] * TAG).all();
+  } catch (e) { if (fehltTabelle(e)) return ergebnis; throw e; }
+  for (const z of (zeilen.results || [])) {
+    const tage = (z.bis - jetzt) <= ERINNERUNG_TAGE[1] * TAG ? ERINNERUNG_TAGE[1] : ERINNERUNG_TAGE[0];
+    let schon;
+    try { schon = await db.prepare('SELECT 1 AS x FROM erinnerung WHERE nutzer_id = ? AND gueltig_bis = ? AND tage = ?').bind(z.nutzer_id, z.bis, tage).first(); } catch (e) { if (fehltTabelle(e)) return ergebnis; throw e; }
+    if (schon) continue;
+    await db.prepare('INSERT OR IGNORE INTO erinnerung (nutzer_id, gueltig_bis, tage) VALUES (?, ?, ?)').bind(z.nutzer_id, z.bis, tage).run();
+    try {
+      const p = PRODUKTE[z.stufe];
+      let link = '';
+      if (paypalEingerichtet(env)) link = dienstUrl(env) + '/bezahlen/verlaengern?t=' + await linkToken(env, z.nutzer_id, z.stufe, jetzt + LINK_TAGE * TAG);
+      const rest = Math.max(1, Math.ceil((z.bis - jetzt) / TAG));
+      const text = 'Hallo,\n\ndein MobiMory ' + STUFEN[z.stufe].name + ' läuft am ' + datumDe(z.bis) + ' ab (in ' + rest + ' Tag' + (rest === 1 ? '' : 'en') + ').\n\n'
+        + 'Wenn du weitermachen möchtest, kannst du für ein weiteres Jahr bezahlen (' + centText(p.cent) + ', also 12 × ' + centText(p.cent / 12) + '):\n'
+        + (link ? '\nMit PayPal: ' + link + '\n' : '')
+        + '\n' + (appUrl(env) ? 'In der App (' + appUrl(env) + ') geht es unter Konto › Deine Stufe, dort auch per Überweisung.' : 'In der App geht es unter Konto › Deine Stufe, dort auch per Überweisung.')
+        + '\n\nEs ist kein Abo: Es wird nichts automatisch abgebucht. Läuft die Zeit ab, bleibt dein Konto auf Basic (1 Fahrzeug, keine Online-Checks). Deine Daten auf dem Gerät bleiben.\n\nWenn du nicht weitermachen möchtest, musst du nichts tun.';
+      await mailSenden(env, z.email, 'MobiMory: Dein ' + STUFEN[z.stufe].name + ' läuft bald ab', text);
+      ergebnis.gesendet += 1;
+    } catch (e) {
+      ergebnis.fehler += 1;
+      try { await db.prepare('DELETE FROM erinnerung WHERE nutzer_id = ? AND gueltig_bis = ? AND tage = ?').bind(z.nutzer_id, z.bis, tage).run(); } catch (e2) { /* nächster Lauf */ }
+    }
+  }
+  return ergebnis;
+}
+
+async function bestellungenAufraeumen(db, jetzt) {
+  try {
+    await db.batch([
+      db.prepare("DELETE FROM bestellung WHERE weg = 'paypal' AND erstellt_am <= ?").bind(jetzt - PAYPAL_BESTELLUNG_TAGE * TAG),
+      db.prepare("DELETE FROM bestellung WHERE weg = 'ueberweisung' AND erstellt_am <= ?").bind(jetzt - UEBERWEISUNG_BESTELLUNG_TAGE * TAG),
+      db.prepare('DELETE FROM erinnerung WHERE gueltig_bis <= ?').bind(jetzt - 400 * TAG)
+    ]);
+  } catch (e) { if (!fehltTabelle(e)) throw e; }
+}
+
+/* ---------- Freischalt-Seite nur für den Betreiber (Überweisungen) ---------- */
+
+const FREISCHALT_SEITE = '<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MobiMory Freischalten</title>'
+  + '<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:1rem auto;padding:0 1rem;line-height:1.5}input,select,button{font-size:1rem;padding:.5rem;margin:.2rem 0;max-width:100%}button{cursor:pointer}'
+  + '.z{border:1px solid #888;border-radius:.5rem;padding:.6rem;margin:.6rem 0}.m{min-height:1.5rem;font-weight:600}</style></head><body>'
+  + '<h1>Freischalten</h1><p>Nur für den Betreiber. Das Passwort bleibt nur in diesem Fenster.</p>'
+  + '<p><label>Passwort<br><input type="password" id="pw" autocomplete="current-password"></label></p>'
+  + '<p><button id="laden">Offene Überweisungen laden</button></p><p class="m" id="meldung" role="status"></p><div id="liste"></div>'
+  + '<h2>Direkt freischalten</h2><p>Wenn Geld ohne Bestellung in der App eingegangen ist.</p>'
+  + '<p><label>E-Mail des Kontos<br><input type="email" id="mail"></label></p>'
+  + '<p><label>Angebot<br><select id="prod"><option value="mittel">Mittel, ein Jahr</option><option value="voll">Voll, ein Jahr</option><option value="recherche5">5 Recherchen</option></select></label></p>'
+  + '<p><button id="direkt">Geld ist da: freischalten</button></p>'
+  + '<script>(function(){var $=function(i){return document.getElementById(i)};function senden(pfad,body){return fetch(pfad,{method:"POST",headers:{"Content-Type":"application/json",Authorization:"Bearer "+$("pw").value},body:JSON.stringify(body||{})}).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j&&j.error||("Fehler "+r.status));return j})})}'
+  + 'function fehler(e){$("meldung").textContent=String(e&&e.message||e)}'
+  + 'function laden(){$("meldung").textContent="";return senden("/freischalten/liste").then(function(j){var l=$("liste");l.textContent="";if(!j.bestellungen.length){$("meldung").textContent="Keine offenen Überweisungen.";return}j.bestellungen.forEach(function(b){var d=document.createElement("div");d.className="z";d.appendChild(document.createTextNode(b.id+" · "+b.email+" · "+b.angebot+" · "+b.betrag+" · bestellt "+b.datum));d.appendChild(document.createElement("br"));var k=document.createElement("button");k.textContent="Geld ist da: freischalten";k.onclick=function(){if(!confirm("Freischalten: "+b.email+", "+b.angebot+"?"))return;senden("/freischalten/bestaetigen",{referenz:b.id}).then(function(r){$("meldung").textContent="Freigeschaltet, Beleg "+r.nummer;return laden()}).catch(fehler)};var x=document.createElement("button");x.textContent="Löschen";x.onclick=function(){if(!confirm("Bestellung "+b.id+" löschen?"))return;senden("/freischalten/loeschen",{referenz:b.id}).then(laden).catch(fehler)};d.appendChild(k);d.appendChild(x);l.appendChild(d)})}).catch(fehler)}'
+  + '$("laden").onclick=laden;$("direkt").onclick=function(){if(!confirm("Freischalten: "+$("mail").value+"?"))return;senden("/freischalten/direkt",{email:$("mail").value,produkt:$("prod").value}).then(function(r){$("meldung").textContent="Freigeschaltet, Beleg "+r.nummer}).catch(fehler)}})();<\/script></body></html>';
+
+async function freischaltSeite() {
+  return new Response(FREISCHALT_SEITE, { status: 200, headers: Object.assign({}, SEITE_KOPF, { 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'", 'X-Robots-Tag': 'noindex' }) });
+}
+
+async function adminPruefen(request, env, db, jetzt) {
+  const soll = adminToken(env);
+  if (!soll) throw new HttpFehler(503, 'Die Freischalt-Seite ist im Dienst nicht eingerichtet (Geheimnis FREISCHALT_TOKEN fehlt oder ist zu kurz).');
+  const m = /^Bearer (.{1,300})$/.exec(request.headers.get('Authorization') || '');
+  const ok = m && gleich(await hmac(pepper(env), 'admin:' + m[1]), await hmac(pepper(env), 'admin:' + soll));
+  if (!ok) {
+    await bremsen(db, await schluesselFuer('adm', request.headers.get('CF-Connecting-IP') || 'unbekannt'), 8, 15 * MINUTE, jetzt, 'Zu viele falsche Versuche.');
+    throw new HttpFehler(401, 'Das Passwort stimmt nicht.');
+  }
+}
+
+async function freischaltListe(request, env, db, jetzt) {
+  await adminPruefen(request, env, db, jetzt);
+  const z = await db.prepare("SELECT id, email, produkt, cent, erstellt_am FROM bestellung WHERE weg = 'ueberweisung' ORDER BY erstellt_am LIMIT 200").all();
+  return { ok: true, bestellungen: (z.results || []).map((r) => ({ id: r.id, email: r.email, angebot: PRODUKTE[r.produkt] ? PRODUKTE[r.produkt].kurz : r.produkt, betrag: centText(r.cent), datum: datumDe(r.erstellt_am) })) };
+}
+
+async function freischaltBestaetigen(request, env, db, jetzt) {
+  await adminPruefen(request, env, db, jetzt);
+  const b = await bodyLesen(request, MAX_BODY);
+  const ref = typeof b.referenz === 'string' ? b.referenz.toUpperCase().trim() : '';
+  const best = /^MM-[A-Z0-9]{8}$/.test(ref) ? await db.prepare("SELECT id, nutzer_id, email, produkt, cent FROM bestellung WHERE id = ? AND weg = 'ueberweisung'").bind(ref).first() : null;
+  if (!best) throw new HttpFehler(404, 'Diese Bestellung gibt es nicht (mehr).');
+  const erg = await bestellungAbschliessen(env, db, best, 'ueberweisung', best.id, jetzt);
+  return { ok: true, nummer: erg.nummer, bis: erg.bis };
+}
+
+async function freischaltDirekt(request, env, db, jetzt) {
+  await adminPruefen(request, env, db, jetzt);
+  const b = await bodyLesen(request, MAX_BODY);
+  const email = emailNormal(b.email);
+  const { id, p } = produktVon(b.produkt);
+  const n = await db.prepare('SELECT id, email FROM nutzer WHERE lower(email) = ? AND bestaetigt_am IS NOT NULL').bind(email).first();
+  if (!n) throw new HttpFehler(404, 'Zu dieser E-Mail-Adresse gibt es kein bestätigtes Konto.');
+  await bestellPruefen(db, n.id, id, jetzt);
+  const bid = await bestellungAnlegen(db, n, id, 'ueberweisung', jetzt);
+  const erg = await bestellungAbschliessen(env, db, { id: bid, nutzer_id: n.id, email: n.email, produkt: id, cent: p.cent }, 'ueberweisung', bid, jetzt);
+  return { ok: true, nummer: erg.nummer, bis: erg.bis };
+}
+
+async function freischaltLoeschen(request, env, db, jetzt) {
+  await adminPruefen(request, env, db, jetzt);
+  const b = await bodyLesen(request, MAX_BODY);
+  const ref = typeof b.referenz === 'string' ? b.referenz.toUpperCase().trim() : '';
+  if (!/^MM-[A-Z0-9]{8}$/.test(ref)) throw new HttpFehler(400, 'Die Bestellnummer ist ungültig.');
+  await db.prepare("DELETE FROM bestellung WHERE id = ? AND weg = 'ueberweisung'").bind(ref).run();
+  return { ok: true };
+}
+
 /* ---------- 13e-3: Kosten-Wächter für die Testwochen (seit 2.0.71) ---------- */
 
 /* Standardwerte (Nutzer, 12.11.2026). Alles lässt sich als Variable im Konto-Worker ändern, ohne neue Version:
      KOSTEN_CHECK            Kosten eines Online-Checks in Euro (Standard 0,45; nur eine Schätzung, der echte Wert kommt aus der OpenAI-Abrechnung)
-     PREIS_MITTEL, PREIS_VOLL   Preis je Monat in Euro (Standard 5 und 10, Richtwerte)
      WAECHTER_ANTEIL         Warnung, wenn die Testwochen-Kosten diesen Anteil der Einnahmen überschreiten (Standard 0,2 = 20 %)
      WAECHTER_TAGE           Zeitraum für die Rechnung in Tagen (Standard 30)
      WAECHTER_CHECKS_TAG     Solange es keine Einnahmen gibt: höchstens so viele Testwochen-Checks in 24 Stunden (Standard 10)
@@ -1273,7 +1695,7 @@ export async function behandeln(request, env, optionen) {
      WAECHTER_EMAIL          Empfänger der Warnung (ohne sie wird nur geprüft und ins Protokoll geschrieben)
      WAECHTER_AUSGENOMMEN    Mail-Adressen, durch Komma getrennt, die nicht mitzählen: eigene Test-Konten und geschenkte Voll-Konten
    Das Konto mit der Stufe „entwickler“ zählt nie mit. */
-export const WAECHTER_STANDARD = { kostenCheck: 0.45, preisMittel: 5, preisVoll: 10, anteil: 0.2, tage: 30, checksTag: 10, testwochenTag: 5 };
+export const WAECHTER_STANDARD = { kostenCheck: 0.45, anteil: 0.2, tage: 30, checksTag: 10, testwochenTag: 5 };
 const WAECHTER_MAIL_ABSTAND = 60 * MINUTE;
 
 function zahlVariable(env, name, standard, min, max) {
@@ -1301,8 +1723,6 @@ function prozentText(x) { return (Math.round(x * 1000) / 10).toString().replace(
 export async function waechterWerte(env, db, jetzt) {
   const k = {
     kostenCheck: zahlVariable(env, 'KOSTEN_CHECK', WAECHTER_STANDARD.kostenCheck, 0, 1000),
-    preisMittel: zahlVariable(env, 'PREIS_MITTEL', WAECHTER_STANDARD.preisMittel, 0, 100000),
-    preisVoll: zahlVariable(env, 'PREIS_VOLL', WAECHTER_STANDARD.preisVoll, 0, 100000),
     anteil: zahlVariable(env, 'WAECHTER_ANTEIL', WAECHTER_STANDARD.anteil, 0.001, 1000),
     tage: Math.round(zahlVariable(env, 'WAECHTER_TAGE', WAECHTER_STANDARD.tage, 1, 365)),
     checksTag: zahlVariable(env, 'WAECHTER_CHECKS_TAG', WAECHTER_STANDARD.checksTag, 0, 1000000),
@@ -1328,7 +1748,15 @@ export async function waechterWerte(env, db, jetzt) {
     for (const r of (bezahlt.results || [])) { if (r.stufe === 'mittel') mittel = r.n; else if (r.stufe === 'voll') voll = r.n; }
     const testChecks = c ? c.n : 0;
     const kosten = testChecks * k.kostenCheck;
-    const einnahmenMonat = mittel * k.preisMittel + voll * k.preisVoll;
+    /* Einnahmen (seit 2.0.72): die echten Belege der letzten 365 Tage, durch 12 geteilt, damit eine Jahreszahlung nicht nur in einem Monat zählt.
+       Belege der ausgenommenen Adressen zählen nicht. Fehlt die Tabelle noch, gibt es keine Einnahmen. */
+    let umsatzCent = 0;
+    try {
+      const u = await db.prepare('SELECT COALESCE(SUM(cent), 0) AS s FROM beleg WHERE am > ?' + (aus.length ? ' AND lower(email) NOT IN (' + platz + ')' : ''))
+        .bind(jetzt - 365 * TAG, ...aus).first();
+      umsatzCent = u ? Number(u.s) : 0;
+    } catch (e) { if (!fehltTabelle(e)) throw e; }
+    const einnahmenMonat = umsatzCent / 100 / 12;
     const einnahmenZeitraum = einnahmenMonat * (k.tage / 30);
     return {
       einstellungen: k, kostenCheckGesetzt, von, bis: jetzt,
@@ -1369,7 +1797,7 @@ function waechterText(w, gruende) {
     + '- Neue Testwochen in den letzten 24 Stunden: ' + w.neueTestwochen24 + '\n'
     + '- Kosten der Testwochen im Zeitraum: ' + euroText(w.kosten) + ' (' + euroText(k.kostenCheck) + ' je Check' + (w.kostenCheckGesetzt ? '' : ', Schätzwert, die Variable KOSTEN_CHECK ist nicht gesetzt') + ')\n'
     + '- Bezahlte Konten: ' + w.kontenMittel + ' Mittel, ' + w.kontenVoll + ' Voll\n'
-    + '- Einnahmen (gerechnet aus den Konten und den Preisen, keine gemessene Zahl): ' + euroText(w.einnahmenZeitraum) + ' im Zeitraum');
+    + '- Einnahmen (Belege der letzten 365 Tage, durch 12 geteilt, auf den Zeitraum umgerechnet): ' + euroText(w.einnahmenZeitraum) + ' im Zeitraum');
   z.push('Eine weitere Mail kommt frühestens in einer Stunde, falls die Werte bleiben. Die Schwellen und Preise stehen als Variablen im Konto-Worker.');
   return z.join('\n\n');
 }
@@ -1409,11 +1837,15 @@ export async function waechterPruefen(env, db, jetzt) {
 
 export default {
   fetch(request, env) { return behandeln(request, env); },
-  /* Cron-Auslöser (wrangler-konto.jsonc, alle 15 Minuten): der Kosten-Wächter. Fehler stören nichts anderes, sie stehen im Protokoll. */
+  /* Cron-Auslöser (wrangler-konto.jsonc, alle 15 Minuten): der Kosten-Wächter und die Erinnerungen vor dem Ablauf. Fehler stören nichts anderes, sie stehen im Protokoll. */
   scheduled(event, env, ctx) {
     const lauf = waechterPruefen(env, datenbank(env), Date.now()).then((r) => {
       console.log('Kosten-Wächter: geprüft=' + r.geprueft + ' Warnung=' + r.warnung + ' Gründe=' + r.gruende.join(',') + ' Mail=' + r.mail);
-    }).catch((e) => { console.log('Kosten-Wächter: Fehler ' + String(e && e.message || e)); });
+    }).catch((e) => { console.log('Kosten-Wächter: Fehler ' + String(e && e.message || e)); })
+      .then(() => bestellungenAufraeumen(datenbank(env), Date.now()))
+      .then(() => erinnerungenSenden(env, datenbank(env), Date.now()))
+      .then((r) => { if (r.gesendet || r.fehler) console.log('Erinnerungen: gesendet=' + r.gesendet + ' fehlgeschlagen=' + r.fehler); })
+      .catch((e) => { console.log('Erinnerungen: Fehler ' + String(e && e.message || e)); });
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(lauf);
     return lauf;
   }
