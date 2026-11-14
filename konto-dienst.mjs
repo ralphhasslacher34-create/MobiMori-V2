@@ -39,6 +39,8 @@
  *      der Halter bestätigt bei jeder Einladung, dass er den Nachweis der Person gesehen hat (Art und „gültig bis“, kein Scan). Drei neue Spalten in „freigabe“ (13f-1.sql).
  * 13f-2 (seit 2.0.75, Bau 1 Mitnutzung): Eine Freigabe hat Rechte („lesen“ oder „mitnutzen“). Mit „mitnutzen“ erfasst der Gast Kilometer, Fahrzeugkosten (nicht Fixkosten) und Störungen
  *      im Fahrzeug des Besitzers (mit Namen des Gastes) und erzeugt Kontroll-Codes. Dokumente lassen sich je Freigabe ausnehmen. Drei neue Spalten in „freigabe“ (13f-2.sql).
+ * 13f-3 (seit 2.0.76, Bau 2 Störung): Meldet ein Gast mit „mitnutzen“ eine Störung, bekommt der Besitzer eine Info-Mail (nur zur Information, ohne Antwortfunktion, höchstens 5 je Freigabe und Stunde).
+ *      Der Gast sieht dazu die früheren Störungen und Arbeiten des Fahrzeugs (nur Texte, keine Beträge), damit die App ähnliche frühere Fälle zeigen kann. Keine neue SQL-Zeile.
  * 13e-5 (seit 2.0.73): Rollen-Tabelle „rolle“ (E-Mail, Name, Funktion Admin oder Entwickler). Die App erkennt daran den Bereich „Nur für Entwickler“;
  *      die Tabelle ändern nur Admins (GET /rolle/liste, POST /rolle/setzen, POST /rolle/entfernen). Eine SQL-Zeile (13e-5.sql), dazu der erste Admin von Hand.
  * 13e-4 (seit 2.0.72): Bezahlung. Zwei Wege: PayPal (der Dienst legt die Bestellung bei PayPal an, nach dem Bezahlen schließt er sie ab und schaltet sofort frei)
@@ -48,7 +50,7 @@
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13f-2';
+export const VERSION = '13f-3';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -996,13 +998,14 @@ async function gastFreigabe(db, a, id, jetzt) {
   return f;
 }
 
+const SICHT_VORGAENGE = 200;
 const J = (feld) => "json_extract(x.nutzlast, '" + feld + "')";
 
 /* Die Datensätze, die ein Gast zu einem Fahrzeug sieht. Der Dienst liefert sie in der Form des Abgleichs, die App baut daraus die Ansicht.
    gast: Fahrzeug, aktuelle Angaben, Fristen samt Erledigungen, Zähler, Dokumente samt Dateien, letztes Prüfergebnis.
    kontrolle: nur Fahrzeug, Dokumente samt Dateien und das letzte Prüfergebnis.
    Nie dabei: Kosten, Notizen, Nachweise, Reisechecks, Routen, Besuche, Ereignisse und Aktivitäten, Personen, Orte, GPS. */
-async function fahrzeugSicht(db, dr, fz, umfang, ausnahmen) {
+async function fahrzeugSicht(db, dr, fz, umfang, ausnahmen, mitVorgaenge) {
   const k = [];
   const holen = async (sql, ...w) => { const r = await db.prepare(sql).bind(...w).all(); (r.results || []).forEach((x) => k.push({ tabelle: x.tabelle, id: x.objekt_id, nutzlast: x.nutzlast })); };
   const AUS = 'SELECT x.tabelle, x.objekt_id, x.nutzlast FROM abgleich x WHERE x.datenraum_id = ? AND x.geloescht = 0 AND ';
@@ -1024,6 +1027,11 @@ async function fahrzeugSicht(db, dr, fz, umfang, ausnahmen) {
     await holen(AUS + "x.tabelle = 'zaehler' AND x.fahrzeug_id = ?", dr, fz);
     await holen(verlaufVon('zaehler', 'zaehler'), dr, dr, fz);
     await holen(AUS + "x.tabelle = 'zaehlerstaende' AND " + J('$.zaehlerId') + ' IN ' + objekte('zaehler') + ' ORDER BY ' + J('$.datum') + ' DESC LIMIT ' + SICHT_STAENDE, dr, dr, fz);
+    /* 13f-3: Mit dem Recht „mitnutzen“ sieht der Gast auch die früheren Störungen und Arbeiten (nur Texte), damit MobiMory ähnliche frühere Fälle zeigen kann. Nie Beträge, nie Dokumente daran. */
+    if (mitVorgaenge) {
+      await holen(AUS + "x.tabelle = 'vorgaenge' AND x.fahrzeug_id = ? ORDER BY x.seq DESC LIMIT " + SICHT_VORGAENGE, dr, fz);
+      await holen(verlaufVon('vorgang', 'vorgaenge'), dr, dr, fz);
+    }
   }
   /* Ausgenommene Dokumente (13f-2): weder das Dokument noch sein Verlauf noch seine Dateien gehen hinaus. */
   if (ausnahmen && ausnahmen.length) {
@@ -1043,7 +1051,7 @@ async function fahrzeugSicht(db, dr, fz, umfang, ausnahmen) {
 async function geteiltFahrzeug(request, env, db, jetzt) {
   const a = await authentifizieren(request, db, jetzt);
   const f = await gastFreigabe(db, a, new URL(request.url).searchParams.get('freigabe'), jetzt);
-  const s = await fahrzeugSicht(db, f.datenraum_id, f.fahrzeug_id, 'gast', f.ausnahmenListe);
+  const s = await fahrzeugSicht(db, f.datenraum_id, f.fahrzeug_id, 'gast', f.ausnahmenListe, f.rechte === 'mitnutzen');
   if (!s) throw new HttpFehler(404, 'Dieses Fahrzeug wird nicht mehr geteilt.');
   const antw = { ok: true, fahrzeugId: f.fahrzeug_id, bis: datumText(f.laeuft_ab), rechte: f.rechte, datensaetze: s };
   if (f.rechte === 'mitnutzen') antw.eigene = await gastEintraege(db, f);
@@ -1207,7 +1215,27 @@ async function geteiltErfassen(request, env, db, jetzt) {
     throw new HttpFehler(400, 'Diese Art von Eintrag gibt es nicht. Möglich sind Kilometer, Kosten und Störung.', { feld: 'art' });
   }
   await abgleichNeu(db, dr, liste, jetzt);
+  if (art === 'stoerung') return { ok: true, id: liste[0].id, mail: await stoerungMailen(env, db, f, a, liste[1].objekt.werte, jetzt) };
   return { ok: true, id: liste[0].id };
+}
+
+/* 13f-3: Info-Mail an den Besitzer, wenn ein Gast eine Störung meldet. Nur zur Information. Ein Fehler hier darf die Meldung nie verhindern,
+   sie ist schon gespeichert. Höchstens 5 Mails je Freigabe und Stunde. Die Mail nennt nichts, was der Besitzer nicht ohnehin sieht. */
+const MAX_STOERUNG_MAILS = 5;
+export const STOERUNG_AUSWIRKUNG_TEXT = { keine: 'Das Fahrzeug bleibt nutzbar.', bedingt: 'Das Fahrzeug ist nur bedingt einsatzfähig.', nicht: 'Das Fahrzeug ist nicht einsatzfähig.' };
+async function stoerungMailen(env, db, f, gast, werte, jetzt) {
+  try {
+    await bremsen(db, await schluesselFuer('gast-m', f.id), MAX_STOERUNG_MAILS, 60 * MINUTE, jetzt, 'Zu viele Mails.');
+    const o = await db.prepare('SELECT n.email AS email FROM datenraum d JOIN nutzer n ON n.id = d.nutzer_id WHERE d.id = ?').bind(f.datenraum_id).first();
+    if (!o || !o.email) return false;
+    const n = await db.prepare("SELECT json_extract(e.nutzlast, '$.werte.bezeichnung') AS name FROM abgleich e WHERE e.datenraum_id = ? AND e.tabelle = 'eintraege' AND e.fahrzeug_id = ? AND e.geloescht = 0 ORDER BY json_extract(e.nutzlast, '$.nr') DESC LIMIT 1").bind(f.datenraum_id, f.fahrzeug_id).first();
+    const fahrzeug = (n && n.name) || 'dein Fahrzeug';
+    const wer = f.gast_name || gast.email;
+    const text = wer + ' hat an „' + fahrzeug + '“ eine Störung gemeldet.\n\n' + werte.bezeichnung + (werte.beschreibung ? '\n' + werte.beschreibung : '') + '\n\n' + (STOERUNG_AUSWIRKUNG_TEXT[werte.auswirkung] || '') +
+      '\n\nDie Störung steht in MobiMory unter Werkstatt (nach dem nächsten Abgleich). Diese Mail ist nur zur Information, du musst nichts tun und sie nicht beantworten.';
+    const r = await mailSenden(env, o.email, 'MobiMory: Störung an „' + fahrzeug + '“ gemeldet', text);
+    return !!(r && r.gesendet);
+  } catch (e) { return false; }
 }
 
 /* Kontroll-Code durch den Gast (Campingplatz, Kontrolle unterwegs): nur mit „mitnutzen“, nie länger als die Freigabe. */
@@ -1306,7 +1334,7 @@ async function gesundheit(env) {
   const bezahlung = { tabellen: bezTabellen, paypal: paypalEingerichtet(env), paypalEchtgeld: !!(env && env.PAYPAL_LIVE === '1'), ueberweisung: !!ueberweisungDaten(env), freischalten: !!adminToken(env), beleg: !!belegAnschrift(env) };
   return {
     ok: true, dienst: DIENST, version: VERSION,
-    datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, rollen, verleih, mitnutzung, waechter,
+    datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, rollen, verleih, mitnutzung, stoerungsmail: true, waechter,
     recherche: !!(env && typeof env.RECHERCHE_URL === 'string' && /^https:\/\//.test(env.RECHERCHE_URL) && typeof env.RECHERCHE_TOKEN === 'string' && env.RECHERCHE_TOKEN.length >= 8),
     pepper: typeof (env && env.PASSWORT_PEPPER) === 'string' && env.PASSWORT_PEPPER.length >= 32,
     mail: !!(env && env.EMAIL && env.ABSENDER),
