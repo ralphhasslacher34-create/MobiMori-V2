@@ -41,6 +41,8 @@
  *      im Fahrzeug des Besitzers (mit Namen des Gastes) und erzeugt Kontroll-Codes. Dokumente lassen sich je Freigabe ausnehmen. Drei neue Spalten in „freigabe“ (13f-2.sql).
  * 13f-3 (seit 2.0.76, Bau 2 Störung): Meldet ein Gast mit „mitnutzen“ eine Störung, bekommt der Besitzer eine Info-Mail (nur zur Information, ohne Antwortfunktion, höchstens 5 je Freigabe und Stunde).
  *      Der Gast sieht dazu die früheren Störungen und Arbeiten des Fahrzeugs (nur Texte, keine Beträge), damit die App ähnliche frühere Fälle zeigen kann. Keine neue SQL-Zeile.
+ * 13f-4 (seit 2.0.77, Bau 3 Planung): Zwei Zeiträume je Freigabe. Ab „plan_ab“ sieht der Gast das Fahrzeug, plant und macht Reisechecks (sie zählen zum Kontingent des Besitzers),
+ *      trägt aber nichts im Fahrzeug ein. Erst ab „ab_am“ gelten seine Rechte (13f-2). Eine neue Spalte in „freigabe“ (13f-4.sql).
  * 13e-5 (seit 2.0.73): Rollen-Tabelle „rolle“ (E-Mail, Name, Funktion Admin oder Entwickler). Die App erkennt daran den Bereich „Nur für Entwickler“;
  *      die Tabelle ändern nur Admins (GET /rolle/liste, POST /rolle/setzen, POST /rolle/entfernen). Eine SQL-Zeile (13e-5.sql), dazu der erste Admin von Hand.
  * 13e-4 (seit 2.0.72): Bezahlung. Zwei Wege: PayPal (der Dienst legt die Bestellung bei PayPal an, nach dem Bezahlen schließt er sie ab und schaltet sofort frei)
@@ -50,7 +52,7 @@
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13f-3';
+export const VERSION = '13f-4';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -812,7 +814,7 @@ function freigabeStatus(f, jetzt) {
   if (f.widerrufen_am) return 'widerrufen';
   if (!f.angenommen_am) return f.einladung_bis <= jetzt || f.laeuft_ab <= jetzt ? 'abgelaufen' : 'eingeladen';
   if (f.laeuft_ab <= jetzt) return 'abgelaufen';
-  if (f.ab_am > jetzt) return 'wartet';
+  if (f.ab_am > jetzt) return f.plan_ab !== null && f.plan_ab !== undefined && f.plan_ab <= jetzt ? 'planung' : 'wartet';
   return 'aktiv';
 }
 
@@ -882,6 +884,15 @@ async function freigabeEinladen(request, env, db, jetzt) {
   if (ab < heute) throw new HttpFehler(400, 'Das Datum „von“ liegt in der Vergangenheit.', { feld: 'ab' });
   if (b.bis < ab) throw new HttpFehler(400, 'Das Datum „bis“ liegt vor dem Datum „von“.', { feld: 'bis' });
   if (b.bis > plusMonate(ab, FREIGABE_MONATE)) throw new HttpFehler(400, 'Eine Freigabe gilt höchstens ' + FREIGABE_MONATE + ' Monate.', { feld: 'bis' });
+  /* Zwei Zeiträume (13f-4): „planAb“ ist der Beginn der Planung. Ab dann sieht der Gast das Fahrzeug, plant und macht Reisechecks. Eintragen darf er erst ab „ab“. */
+  let planAb = null;
+  if (b.planAb !== undefined && b.planAb !== null && b.planAb !== '') {
+    if (!datumTeile(b.planAb)) throw new HttpFehler(400, 'Das Datum „Planung ab“ ist ungültig.', { feld: 'planAb' });
+    if (b.planAb < heute) throw new HttpFehler(400, 'Das Datum „Planung ab“ liegt in der Vergangenheit.', { feld: 'planAb' });
+    if (b.planAb > ab) throw new HttpFehler(400, 'Die Planung muss vor oder am Tag des Verleihs beginnen.', { feld: 'planAb' });
+    if (ab > plusMonate(b.planAb, FREIGABE_MONATE)) throw new HttpFehler(400, 'Die Planung darf höchstens ' + FREIGABE_MONATE + ' Monate vor dem Verleih beginnen.', { feld: 'planAb' });
+    if (b.planAb < ab) planAb = b.planAb;
+  }
   if (!(await fahrzeugDa(db, dr, fz))) throw new HttpFehler(404, 'Dieses Fahrzeug liegt nicht beim Dienst. Bitte zuerst unter Funktionen › Konto abgleichen.', { feld: 'fahrzeugId' });
   const gs = await gaesteStand(db, a, dr, jetzt, email);
   if (!gs.erlaubt) throw new HttpFehler(403, 'Gäste einladen geht ab der Stufe Mittel. Mit Basic ist das nicht möglich.', { stufe: gs.st.id });
@@ -900,25 +911,27 @@ async function freigabeEinladen(request, env, db, jetzt) {
   const id = crypto.randomUUID();
   const laeuftAb = tagEnde(b.bis), abAm = tagAnfang(ab), einladungBis = Math.min(laeuftAb, jetzt + EINLADUNG_TAGE * TAG);
   /* Gleiches Fahrzeug und gleicher Gast: Die ältere Freigabe wird ersetzt. */
+  const spalten = 'id, datenraum_id, fahrzeug_id, email, code_hash, erstellt_am, ab_am, laeuft_ab, einladung_bis, nachweis_art, nachweis_bis, bestaetigt_am, rechte, gast_name, ausnahmen' + (planAb ? ', plan_ab' : '');
+  const werte = [id, dr, fz, email, await codeAbdruck(env, 'freigabe', code), jetzt, abAm, laeuftAb, einladungBis, bf.art, bf.bis, jetzt, mn.rechte, mn.gastName, mn.ausnahmen.length ? JSON.stringify(mn.ausnahmen) : null];
+  if (planAb) werte.push(tagAnfang(planAb));
   try {
     await db.batch([
       db.prepare('UPDATE freigabe SET widerrufen_am = ? WHERE datenraum_id = ? AND fahrzeug_id = ? AND email = ? AND widerrufen_am IS NULL').bind(jetzt, dr, fz, email),
-      db.prepare('INSERT INTO freigabe (id, datenraum_id, fahrzeug_id, email, code_hash, erstellt_am, ab_am, laeuft_ab, einladung_bis, nachweis_art, nachweis_bis, bestaetigt_am, rechte, gast_name, ausnahmen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .bind(id, dr, fz, email, await codeAbdruck(env, 'freigabe', code), jetzt, abAm, laeuftAb, einladungBis, bf.art, bf.bis, jetzt, mn.rechte, mn.gastName, mn.ausnahmen.length ? JSON.stringify(mn.ausnahmen) : null)
+      db.prepare('INSERT INTO freigabe (' + spalten + ') VALUES (' + werte.map(() => '?').join(', ') + ')').bind(...werte)
     ]);
   } catch (e) {
-    if (/no such column|has no column/i.test(String(e && e.message || e))) throw new HttpFehler(503, 'Im Dienst fehlt eine SQL-Zeile (13f-1 Verleih oder 13f-2 Mitnutzung). Siehe server/EINRICHTUNG.md, „Update auf 13f-2“.');
+    if (/no such column|has no column/i.test(String(e && e.message || e))) throw new HttpFehler(503, planAb ? 'Im Dienst fehlt die SQL-Zeile 13f-4 (Planung vor dem Verleih). Siehe server/EINRICHTUNG.md, „Update auf 13f-4“.' : 'Im Dienst fehlt eine SQL-Zeile (13f-1 Verleih oder 13f-2 Mitnutzung). Siehe server/EINRICHTUNG.md, „Update auf 13f-2“.');
     throw e;
   }
   let r;
   try {
     r = await mailSenden(env, email, 'Ein Fahrzeug wurde für dich in MobiMory freigegeben',
-      a.email + ' verleiht dir ein Fahrzeug (' + (mn.rechte === 'mitnutzen' ? 'du kannst Kilometer, Kosten und Störungen eintragen' : 'du kannst die Angaben dazu nur lesen') + '), gültig von ' + ab + ' bis ' + b.bis + '.\n\nDein Code: ' + code + '\n\nMelde dich in MobiMory mit dieser E-Mail-Adresse an und trage den Code unter Funktionen › Verleih ein. Er gilt ' + EINLADUNG_TAGE + ' Tage und nur einmal.\n\nWenn du die Einladung nicht erwartest, ignoriere diese E-Mail. Es passiert nichts.');
+      a.email + ' verleiht dir ein Fahrzeug (' + (mn.rechte === 'mitnutzen' ? 'du kannst Kilometer, Kosten und Störungen eintragen' : 'du kannst die Angaben dazu nur lesen') + '), gültig von ' + ab + ' bis ' + b.bis + '.' + (planAb ? ' Ab dem ' + planAb + ' kannst du das Fahrzeug schon ansehen, deine Reise planen und Reisechecks machen. Eintragen im Fahrzeug kannst du erst ab dem ' + ab + '.' : '') + '\n\nDein Code: ' + code + '\n\nMelde dich in MobiMory mit dieser E-Mail-Adresse an und trage den Code unter Funktionen › Verleih ein. Er gilt ' + EINLADUNG_TAGE + ' Tage und nur einmal.\n\nWenn du die Einladung nicht erwartest, ignoriere diese E-Mail. Es passiert nichts.');
   } catch (e) {
     await db.prepare('DELETE FROM freigabe WHERE id = ?').bind(id).run();
     throw e;
   }
-  return { ok: true, id, ab, bis: b.bis, einladungBis, codeGesendet: !!r.gesendet, entwicklungsCode: r.entwicklung ? code : undefined };
+  return { ok: true, id, ab, planAb, bis: b.bis, einladungBis, codeGesendet: !!r.gesendet, entwicklungsCode: r.entwicklung ? code : undefined };
 }
 
 /* Der Gast nimmt mit dem Code an. Der Code gilt nur für die eingeladene E-Mail-Adresse und nur einmal. */
@@ -951,8 +964,12 @@ async function freigabeListe(request, env, db, jetzt) {
   const a = await authentifizieren(request, db, jetzt), dr = a.datenraumId || '';
   const kopf = 'SELECT f.id, f.fahrzeug_id, f.email, f.ab_am, f.laeuft_ab, f.einladung_bis, f.angenommen_am, f.widerrufen_am, ';
   const fuss = NAME_VON_FAHRZEUG + ' AS name FROM freigabe f WHERE f.datenraum_id = ? ORDER BY f.erstellt_am DESC LIMIT 200';
-  let g, verleihSpalten = true, mitnutzungSpalten = true;
-  try { g = await db.prepare(kopf + 'f.nachweis_art, f.nachweis_bis, f.bestaetigt_am, f.rechte, f.gast_name, f.ausnahmen, ' + fuss).bind(dr).all(); } catch (e) {
+  let g, verleihSpalten = true, mitnutzungSpalten = true, planungSpalte = true;
+  try { g = await db.prepare(kopf + 'f.nachweis_art, f.nachweis_bis, f.bestaetigt_am, f.rechte, f.gast_name, f.ausnahmen, f.plan_ab, ' + fuss).bind(dr).all(); } catch (e0) {
+    if (!/no such column/i.test(String(e0 && e0.message || e0))) throw e0;
+    planungSpalte = false;
+  }
+  if (!g) try { g = await db.prepare(kopf + 'f.nachweis_art, f.nachweis_bis, f.bestaetigt_am, f.rechte, f.gast_name, f.ausnahmen, ' + fuss).bind(dr).all(); } catch (e) {
     if (!/no such column/i.test(String(e && e.message || e))) throw e;
     mitnutzungSpalten = false;
     try { g = await db.prepare(kopf + 'f.nachweis_art, f.nachweis_bis, f.bestaetigt_am, ' + fuss).bind(dr).all(); } catch (e2) {
@@ -964,35 +981,47 @@ async function freigabeListe(request, env, db, jetzt) {
   const gs = await gaesteStand(db, a, dr, jetzt, '');
   const erhaltenSql = (rechteSpalte) => 'SELECT f.id, f.fahrzeug_id, n.email AS von, f.ab_am, f.laeuft_ab, f.einladung_bis, f.angenommen_am, f.widerrufen_am, ' + rechteSpalte + NAME_VON_FAHRZEUG + ' AS name FROM freigabe f JOIN datenraum d ON d.id = f.datenraum_id JOIN nutzer n ON n.id = d.nutzer_id WHERE f.gast_nutzer_id = ? ORDER BY f.erstellt_am DESC LIMIT 200';
   let e;
-  try { e = await db.prepare(erhaltenSql('f.rechte, ')).bind(a.id).all(); } catch (x) {
+  try { e = await db.prepare(erhaltenSql('f.rechte, f.plan_ab, ')).bind(a.id).all(); } catch (x) {
     if (!/no such column/i.test(String(x && x.message || x))) throw x;
-    e = await db.prepare(erhaltenSql('')).bind(a.id).all();
+    try { e = await db.prepare(erhaltenSql('f.rechte, ')).bind(a.id).all(); } catch (x2) {
+      if (!/no such column/i.test(String(x2 && x2.message || x2))) throw x2;
+      e = await db.prepare(erhaltenSql('')).bind(a.id).all();
+    }
   }
   const k = await db.prepare('SELECT f.id, f.fahrzeug_id, f.laeuft_ab, f.widerrufen_am, ' + NAME_VON_FAHRZEUG + ' AS name FROM kontrolle f WHERE f.datenraum_id = ? ORDER BY f.erstellt_am DESC LIMIT 200').bind(dr).all();
   const tag = (ms) => datumText(ms);
   return {
     ok: true,
     verleih: {
-      spalten: verleihSpalten, mitnutzung: mitnutzungSpalten, erlaubt: gs.erlaubt, stufe: gs.st ? gs.st.id : null, stufeName: gs.st ? gs.st.name : null,
+      spalten: verleihSpalten, mitnutzung: mitnutzungSpalten, planung: planungSpalte, erlaubt: gs.erlaubt, stufe: gs.st ? gs.st.id : null, stufeName: gs.st ? gs.st.name : null,
       gaeste: { grenze: gs.grenze, eigene: gs.eigene, belegt: gs.belegt, frei: gs.frei }
     },
     gegeben: (g.results || []).map((f) => ({ id: f.id, fahrzeugId: f.fahrzeug_id, name: f.name || null, email: f.email, ab: tag(f.ab_am), bis: tag(f.laeuft_ab), status: freigabeStatus(f, jetzt),
-      nachweisArt: f.nachweis_art || null, nachweisBis: f.nachweis_bis || null, bestaetigtAm: f.bestaetigt_am ? datumText(f.bestaetigt_am) : null,
+      planAb: f.plan_ab ? tag(f.plan_ab) : null, nachweisArt: f.nachweis_art || null, nachweisBis: f.nachweis_bis || null, bestaetigtAm: f.bestaetigt_am ? datumText(f.bestaetigt_am) : null,
       rechte: f.rechte || 'lesen', gastName: f.gast_name || null, ausnahmen: ausnahmenLesen(f.ausnahmen).length })),
-    erhalten: (e.results || []).filter((f) => !f.widerrufen_am).map((f) => ({ id: f.id, fahrzeugId: f.fahrzeug_id, name: f.name || null, von: f.von, ab: tag(f.ab_am), bis: tag(f.laeuft_ab), status: freigabeStatus(f, jetzt), rechte: f.rechte || 'lesen' })),
+    erhalten: (e.results || []).filter((f) => !f.widerrufen_am).map((f) => ({ id: f.id, fahrzeugId: f.fahrzeug_id, name: f.name || null, von: f.von, ab: tag(f.ab_am), planAb: f.plan_ab ? tag(f.plan_ab) : null, bis: tag(f.laeuft_ab), status: freigabeStatus(f, jetzt), rechte: f.rechte || 'lesen' })),
     kontrollen: (k.results || []).map((f) => ({ id: f.id, fahrzeugId: f.fahrzeug_id, name: f.name || null, laeuftAb: f.laeuft_ab, status: f.widerrufen_am ? 'widerrufen' : (f.laeuft_ab <= jetzt ? 'abgelaufen' : 'aktiv') }))
   };
 }
 
 /* Die Freigabe, die dieses Konto gerade zum Lesen berechtigt. Alles andere ist 403, nie mehr Auskunft als nötig. */
-async function gastFreigabe(db, a, id, jetzt) {
+async function gastFreigabe(db, a, id, jetzt, schreiben) {
   const sql = (extra) => 'SELECT id, datenraum_id, fahrzeug_id, gast_nutzer_id, ab_am, laeuft_ab, angenommen_am, widerrufen_am' + extra + ' FROM freigabe WHERE id = ?';
-  let f;
-  try { f = await db.prepare(sql(', rechte, gast_name, ausnahmen')).bind(kennung(id, 'freigabe')).first(); } catch (e) {
-    if (!/no such column/i.test(String(e && e.message || e))) throw e;
-    f = await db.prepare(sql('')).bind(kennung(id, 'freigabe')).first();
+  let f = null;
+  /* Neueste Spalten zuerst (13f-4: plan_ab), dann 13f-2 (Rechte), dann ohne. */
+  for (const extra of [', rechte, gast_name, ausnahmen, plan_ab', ', rechte, gast_name, ausnahmen', '']) {
+    try { f = await db.prepare(sql(extra)).bind(kennung(id, 'freigabe')).first(); break; } catch (e) {
+      if (!/no such column/i.test(String(e && e.message || e))) throw e;
+    }
   }
-  if (!f || f.gast_nutzer_id !== a.id || !f.angenommen_am || f.widerrufen_am || f.ab_am > jetzt || f.laeuft_ab <= jetzt) throw new HttpFehler(403, 'Diese Freigabe gilt nicht (mehr).');
+  if (!f || f.gast_nutzer_id !== a.id || !f.angenommen_am || f.widerrufen_am || f.laeuft_ab <= jetzt) throw new HttpFehler(403, 'Diese Freigabe gilt nicht (mehr).');
+  /* Zwei Zeiträume (13f-4): Ab „plan_ab“ sieht der Gast das Fahrzeug und darf planen und prüfen (Phase „planung“), ab „ab_am“ gelten seine Rechte (Phase „nutzung“). */
+  const planAb = f.plan_ab === null || f.plan_ab === undefined ? null : f.plan_ab;
+  if (f.ab_am <= jetzt) f.phase = 'nutzung';
+  else if (planAb !== null && planAb <= jetzt) f.phase = 'planung';
+  else throw new HttpFehler(403, 'Diese Freigabe gilt nicht (mehr).');
+  if (schreiben && f.phase !== 'nutzung') throw new HttpFehler(403, 'Eintragen im Fahrzeug geht erst ab ' + datumText(f.ab_am) + '. Bis dahin kannst du planen und Reisechecks machen.', { phase: 'planung', ab: datumText(f.ab_am) });
+  f.planAb = planAb;
   f.rechte = f.rechte === 'mitnutzen' ? 'mitnutzen' : 'lesen';
   f.ausnahmenListe = ausnahmenLesen(f.ausnahmen);
   return f;
@@ -1053,8 +1082,8 @@ async function geteiltFahrzeug(request, env, db, jetzt) {
   const f = await gastFreigabe(db, a, new URL(request.url).searchParams.get('freigabe'), jetzt);
   const s = await fahrzeugSicht(db, f.datenraum_id, f.fahrzeug_id, 'gast', f.ausnahmenListe, f.rechte === 'mitnutzen');
   if (!s) throw new HttpFehler(404, 'Dieses Fahrzeug wird nicht mehr geteilt.');
-  const antw = { ok: true, fahrzeugId: f.fahrzeug_id, bis: datumText(f.laeuft_ab), rechte: f.rechte, datensaetze: s };
-  if (f.rechte === 'mitnutzen') antw.eigene = await gastEintraege(db, f);
+  const antw = { ok: true, fahrzeugId: f.fahrzeug_id, bis: datumText(f.laeuft_ab), rechte: f.rechte, phase: f.phase, nutzungAb: datumText(f.ab_am), planAb: f.planAb === null ? null : datumText(f.planAb), datensaetze: s };
+  if (f.rechte === 'mitnutzen' && f.phase === 'nutzung') antw.eigene = await gastEintraege(db, f);
   return antw;
 }
 
@@ -1159,7 +1188,7 @@ async function gastFahrzeugRecord(db, f) {
 async function geteiltErfassen(request, env, db, jetzt) {
   const a = await authentifizieren(request, db, jetzt);
   const b = await bodyLesen(request);
-  const f = await gastFreigabe(db, a, b.freigabe, jetzt);
+  const f = await gastFreigabe(db, a, b.freigabe, jetzt, true);
   if (f.rechte !== 'mitnutzen') throw new HttpFehler(403, 'Diese Freigabe erlaubt nur das Ansehen. Der Besitzer kann dir die Mitnutzung geben.');
   await bremsen(db, await schluesselFuer('gast-e', a.id), 120, 60 * MINUTE, jetzt, 'Du hast in kurzer Zeit zu viele Einträge gemacht.');
   if ((await gastAnzahl(db, f)) >= MAX_GAST_EINTRAEGE) throw new HttpFehler(409, 'Für diese Freigabe gibt es schon ' + MAX_GAST_EINTRAEGE + ' Einträge. Bitte den Besitzer fragen.');
@@ -1242,7 +1271,7 @@ async function stoerungMailen(env, db, f, gast, werte, jetzt) {
 async function geteiltKontrolle(request, env, db, jetzt) {
   const a = await authentifizieren(request, db, jetzt);
   const b = await bodyLesen(request);
-  const f = await gastFreigabe(db, a, b.freigabe, jetzt);
+  const f = await gastFreigabe(db, a, b.freigabe, jetzt, true);
   if (f.rechte !== 'mitnutzen') throw new HttpFehler(403, 'Diese Freigabe erlaubt nur das Ansehen. Der Besitzer kann dir die Mitnutzung geben.');
   const stunden = b.stunden === undefined || b.stunden === null ? KONTROLLE_STANDARD_STUNDEN : b.stunden;
   if (!Number.isInteger(stunden) || stunden < 1 || stunden > KONTROLLE_MAX_STUNDEN) throw new HttpFehler(400, 'Die Gültigkeit liegt zwischen 1 Stunde und ' + KONTROLLE_MAX_STUNDEN + ' Stunden (7 Tage).', { feld: 'stunden' });
@@ -1326,6 +1355,8 @@ async function gesundheit(env) {
   try { await datenbank(env).prepare('SELECT nachweis_art, nachweis_bis, bestaetigt_am FROM freigabe LIMIT 1').first(); verleih = true; } catch (e) { verleih = false; }
   let mitnutzung = false;
   try { await datenbank(env).prepare('SELECT rechte, gast_name, ausnahmen FROM freigabe LIMIT 1').first(); mitnutzung = true; } catch (e) { mitnutzung = false; }
+  let planung = false;
+  try { await datenbank(env).prepare('SELECT plan_ab FROM freigabe LIMIT 1').first(); planung = true; } catch (e) { planung = false; }
   let waechter = false;
   try { await datenbank(env).prepare('SELECT 1 FROM waechter_stand LIMIT 1').first(); waechter = !!(env && env.EMAIL && env.ABSENDER && waechterEmpfaenger(env)); } catch (e) { waechter = false; }
   /* Bezahlung (13e-4): die Tabellen und was im Worker eingetragen ist. Es steht nur „ja“ oder „nein“ da, nie ein Wert. */
@@ -1334,7 +1365,7 @@ async function gesundheit(env) {
   const bezahlung = { tabellen: bezTabellen, paypal: paypalEingerichtet(env), paypalEchtgeld: !!(env && env.PAYPAL_LIVE === '1'), ueberweisung: !!ueberweisungDaten(env), freischalten: !!adminToken(env), beleg: !!belegAnschrift(env) };
   return {
     ok: true, dienst: DIENST, version: VERSION,
-    datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, rollen, verleih, mitnutzung, stoerungsmail: true, waechter,
+    datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, rollen, verleih, mitnutzung, planung, stoerungsmail: true, waechter,
     recherche: !!(env && typeof env.RECHERCHE_URL === 'string' && /^https:\/\//.test(env.RECHERCHE_URL) && typeof env.RECHERCHE_TOKEN === 'string' && env.RECHERCHE_TOKEN.length >= 8),
     pepper: typeof (env && env.PASSWORT_PEPPER) === 'string' && env.PASSWORT_PEPPER.length >= 32,
     mail: !!(env && env.EMAIL && env.ABSENDER),
@@ -1506,10 +1537,18 @@ async function checkSenden(request, env, db, jetzt, optionen) {
   if (!CHECK_ARTEN.includes(art)) throw new HttpFehler(400, 'Die Art des Checks fehlt oder ist unbekannt.', { feld: 'art' });
   if (!b.anfrage || typeof b.anfrage !== 'object' || Array.isArray(b.anfrage)) throw new HttpFehler(400, 'Die Anfrage fehlt.', { feld: 'anfrage' });
   const quelle = b.quelle === 'gespeichert' ? 'gespeichert' : 'frisch';
-  if (!a.datenraumId) throw new HttpFehler(400, 'Zu diesem Konto gehört noch kein Datenraum.');
-  const st = await stufeVon(db, a.id, jetzt, false);
+  /* Gast (13f-4): Mit „freigabe“ prüft ein Gast in der Planung oder Nutzung. Der Check zählt zum Kontingent des Besitzers (Festlegung vom 12.11.), der Gast hat keines. */
+  let gastF = null, zahler = { id: a.id, datenraumId: a.datenraumId };
+  if (b.freigabe !== undefined && b.freigabe !== null && b.freigabe !== '') {
+    gastF = await gastFreigabe(db, a, b.freigabe, jetzt);
+    const besitzer = await db.prepare('SELECT nutzer_id FROM datenraum WHERE id = ?').bind(gastF.datenraum_id).first();
+    if (!besitzer) throw new HttpFehler(404, 'Dieses Fahrzeug wird nicht mehr geteilt.');
+    zahler = { id: besitzer.nutzer_id, datenraumId: gastF.datenraum_id };
+  }
+  if (!zahler.datenraumId) throw new HttpFehler(400, 'Zu diesem Konto gehört noch kein Datenraum.');
+  const st = await stufeVon(db, zahler.id, jetzt, false);
   if (!st.grenzen.online) {
-    throw new HttpFehler(402, 'Online-Checks gibt es ab der Stufe Mittel. Deine Stufe ist ' + st.name + '.', { stufe: st.id });
+    throw new HttpFehler(402, gastF ? 'Online-Checks sind in der Stufe des Besitzers nicht enthalten.' : 'Online-Checks gibt es ab der Stufe Mittel. Deine Stufe ist ' + st.name + '.', gastF ? {} : { stufe: st.id });
   }
   const schluessel = await sha256Hex(art + ':' + stabilText(b.anfrage));
 
@@ -1525,23 +1564,25 @@ async function checkSenden(request, env, db, jetzt, optionen) {
   const token = env && typeof env.RECHERCHE_TOKEN === 'string' ? env.RECHERCHE_TOKEN : '';
   if (!/^https:\/\//.test(url) || token.length < 8) throw new HttpFehler(503, 'Der Recherche-Dienst ist im Konto-Dienst noch nicht eingetragen.');
 
-  await bremsen(db, await schluesselFuer('chk', a.datenraumId), 8, 10 * MINUTE, jetzt, 'Es wurden zu viele Checks hintereinander gestartet.');
-  const genutzt = await checksGenutzt(db, a.datenraumId, st.id, jetzt);
+  if (gastF) await bremsen(db, await schluesselFuer('chk-g', a.id), 8, 10 * MINUTE, jetzt, 'Es wurden zu viele Checks hintereinander gestartet.');
+  await bremsen(db, await schluesselFuer('chk', zahler.datenraumId), 8, 10 * MINUTE, jetzt, 'Es wurden zu viele Checks hintereinander gestartet.');
+  const genutzt = await checksGenutzt(db, zahler.datenraumId, st.id, jetzt);
   /* Ist das Kontingent der Stufe aufgebraucht, werden nachgekaufte Recherchen benutzt (seit 2.0.72). Sie zählen nicht zum Kontingent (Stufe „extra“). */
   let extraGenommen = false;
   if (st.grenzen.checks !== null && genutzt >= st.grenzen.checks) {
-    extraGenommen = await extraNehmen(db, a.id);
+    extraGenommen = await extraNehmen(db, zahler.id);
     if (!extraGenommen) {
+      if (gastF) throw new HttpFehler(402, 'Das Kontingent des Besitzers für Online-Checks ist aufgebraucht. Ein gespeicherter Check zählt nicht.', {});
       throw new HttpFehler(402, 'Dein Kontingent ist aufgebraucht: ' + genutzt + ' von ' + st.grenzen.checks + ' Online-Checks in den letzten 12 Monaten. Ein gespeicherter Check zählt nicht. Unter Konto kannst du 5 zusätzliche Recherchen kaufen.', { genutzt, grenze: st.grenzen.checks, stufe: st.id });
     }
   }
   const nid = crypto.randomUUID();
   try {
-    await db.prepare('INSERT INTO check_nutzung (id, datenraum_id, art, stufe, am, status) VALUES (?, ?, ?, ?, ?, ?)').bind(nid, a.datenraumId, art, extraGenommen ? 'extra' : st.id, jetzt, 'laeuft').run();
-  } catch (e) { if (extraGenommen) await extraZurueck(db, a.id); throw e; }
+    await db.prepare('INSERT INTO check_nutzung (id, datenraum_id, art, stufe, am, status) VALUES (?, ?, ?, ?, ?, ?)').bind(nid, zahler.datenraumId, art, extraGenommen ? 'extra' : st.id, jetzt, 'laeuft').run();
+  } catch (e) { if (extraGenommen) await extraZurueck(db, zahler.id); throw e; }
   async function zurueck() {
     try { await db.prepare('DELETE FROM check_nutzung WHERE id = ?').bind(nid).run(); } catch (e) { /* wird später aufgeräumt */ }
-    if (extraGenommen) await extraZurueck(db, a.id);
+    if (extraGenommen) await extraZurueck(db, zahler.id);
   }
 
   const holen = (optionen && optionen.fetch) || fetch;
@@ -1573,6 +1614,8 @@ async function checkSenden(request, env, db, jetzt, optionen) {
   if (roh.length <= MAX_CHECK_ERGEBNIS) {
     await db.prepare('INSERT INTO check_ergebnis (schluessel, art, antwort, erstellt_am) VALUES (?, ?, ?, ?) ON CONFLICT(schluessel) DO UPDATE SET antwort = excluded.antwort, erstellt_am = excluded.erstellt_am').bind(schluessel, art, roh, jetzt).run();
   }
+  /* Dem Gast zeigt der Dienst nie die Zahlen des Besitzers. */
+  if (gastF) return { ok: true, gespeichert: false, antwort, kontingent: null };
   const kontingent = { genutzt: extraGenommen ? genutzt : genutzt + 1, grenze: st.grenzen.checks, stufe: st.id };
   if (extraGenommen) kontingent.extraFrei = await extraFrei(db, a.id);
   return { ok: true, gespeichert: false, antwort, kontingent };
