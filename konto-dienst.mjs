@@ -47,6 +47,9 @@
  *      oder genau 100 % als persönlicher Code (Grenze 1): schaltet Mittel oder Voll für 1 bis 12 Monate ohne Zahlung frei, PayPal wird dann nicht aufgerufen. Jeder Code hat ein Ablaufdatum.
  *      Nur Admins legen Codes an (POST /gutschein/anlegen, GET /gutschein/liste, POST /gutschein/loeschen). Kunden: POST /gutschein/pruefen, POST /gutschein/einloesen.
  *      Zwei neue Tabellen und vier neue Spalten (13f-8.sql). Der Beleg weist den Rabatt als eigene Zeile aus.
+ * 13f-9 (seit 2.0.84): Beim Anlegen eines Codes kann der Admin eine E-Mail-Adresse des Empfängers eintragen (Feld „empfaenger“, freiwillig). Persönlicher Code (Grenze 1): Mail an die Person,
+ *      die ihn einlösen soll. Code für viele (Grenze über 1): Mail an den, der ihn verteilt. Die Adresse wird nicht gespeichert. Die Antwort meldet „mail“ (true oder false);
+ *      der Code ist auch ohne Mail angelegt. Keine neue SQL-Zeile.
  * 13e-5 (seit 2.0.73): Rollen-Tabelle „rolle“ (E-Mail, Name, Funktion Admin oder Entwickler). Die App erkennt daran den Bereich „Nur für Entwickler“;
  *      die Tabelle ändern nur Admins (GET /rolle/liste, POST /rolle/setzen, POST /rolle/entfernen). Eine SQL-Zeile (13e-5.sql), dazu der erste Admin von Hand.
  * 13e-4 (seit 2.0.72): Bezahlung. Zwei Wege: PayPal (der Dienst legt die Bestellung bei PayPal an, nach dem Bezahlen schließt er sie ab und schaltet sofort frei)
@@ -56,7 +59,7 @@
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13f-8';
+export const VERSION = '13f-9';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -2090,6 +2093,11 @@ async function gutscheinAnlegen(request, env, db, jetzt) {
   if (ablauf <= jetzt) throw new HttpFehler(400, 'Das Ablaufdatum muss in der Zukunft liegen.', { feld: 'laeuftAb' });
   if (ablauf > jetzt + GUTSCHEIN_MAX_JAHRE * 366 * TAG) throw new HttpFehler(400, 'Das Ablaufdatum darf höchstens ' + GUTSCHEIN_MAX_JAHRE + ' Jahre entfernt sein.', { feld: 'laeuftAb' });
   const notiz = typeof b.notiz === 'string' ? b.notiz.trim().slice(0, 80) : '';
+  /* Empfänger der Mail (freiwillig, 13f-9): wird nur zum Senden gebraucht und nicht gespeichert. */
+  let empfaenger = '';
+  if (typeof b.empfaenger === 'string' && b.empfaenger.trim()) {
+    try { empfaenger = emailNormal(b.empfaenger); } catch (e) { throw new HttpFehler(400, 'Die E-Mail-Adresse des Empfängers ist ungültig.', { feld: 'empfaenger' }); }
+  }
   /* Ein 100-%-Code ist Geld wert: Er wird immer zufällig erzeugt, nie frei gewählt. */
   const eigener = !frei && typeof b.code === 'string' && b.code.trim() ? gutscheinCode(b.code) : '';
   if (!frei && typeof b.code === 'string' && b.code.trim() && !eigener) throw new HttpFehler(400, 'Der Code darf nur Buchstaben und Ziffern enthalten (4 bis 24 Zeichen).', { feld: 'code' });
@@ -2110,8 +2118,32 @@ async function gutscheinAnlegen(request, env, db, jetzt) {
     }
     await db.prepare('INSERT INTO gutschein (code, prozent, stufe, monate, grenze, eingeloest, laeuft_ab, erstellt_am, erstellt_von, notiz) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)')
       .bind(code, prozent, stufe, monate, grenze, ablauf, jetzt, a.email, notiz || null).run();
-    return { ok: true, code: codeAnzeige(code) };
+    const antwort = { ok: true, code: codeAnzeige(code) };
+    if (empfaenger) {
+      let r = null;
+      try { r = await mailSenden(env, empfaenger, gutscheinMailBetreff(grenze), gutscheinMailText({ code, prozent, stufe, monate, grenze, ablauf })); } catch (e) { r = null; }
+      antwort.mail = !!(r && r.gesendet === true);
+    }
+    return antwort;
   });
+}
+
+/* Mail beim Anlegen (13f-9). Persönlicher Code (Grenze 1): an die Person, die ihn einlöst. Code für viele: an den, der ihn verteilt. */
+function gutscheinMailBetreff(grenze) { return grenze > 1 ? 'MobiMory: Gutscheincode zum Weitergeben' : 'MobiMory: Dein Gutscheincode'; }
+function gutscheinMailText(g) {
+  const frei = g.prozent === 100;
+  const was = frei
+    ? STUFEN[g.stufe].name + ' für ' + g.monate + (g.monate === 1 ? ' Monat' : ' Monate') + ', ohne Bezahlen'
+    : String(Math.round(g.prozent * 100) / 100).replace('.', ',') + ' % Rabatt auf den ersten Kauf von Mittel oder Voll (nur für Neukunden)';
+  const viele = g.grenze > 1;
+  return 'Hallo,\n\n'
+    + (viele ? 'hier ist ein MobiMory-Code zum Weitergeben:' : 'für dich gibt es einen MobiMory-Code:') + '\n\n'
+    + codeAnzeige(g.code) + '\n\n'
+    + 'Das bewirkt er: ' + was + '.\n'
+    + 'Er gilt bis ' + datumDe(g.ablauf) + (viele ? ' und kann ' + g.grenze + '-mal eingelöst werden (je Konto einmal).' : ' und kann einmal eingelöst werden.') + '\n\n'
+    + (viele ? 'So lösen ihn die Empfänger ein: ' : 'So löst du ihn ein: ')
+    + 'In der App unter Konto › Deine Stufe › Gutscheincode bei dem Angebot eintragen, das gewünscht ist (Mittel oder Voll), „Code prüfen“ antippen und dann ' + (frei ? '„Code einlösen“.' : 'wie gewohnt bezahlen. Der Preis steht dann mit Rabatt da.') + '\n\n'
+    + 'Bitte gib den Code nur weiter, wenn das so gedacht ist.';
 }
 
 async function gutscheinListe(request, env, db, jetzt) {
