@@ -2142,8 +2142,7 @@ function gutscheinMailText(g) {
     + 'Das bewirkt er: ' + was + '.\n'
     + 'Er gilt bis ' + datumDe(g.ablauf) + (viele ? ' und kann ' + g.grenze + '-mal eingelöst werden (je Konto einmal).' : ' und kann einmal eingelöst werden.') + '\n\n'
     + (viele ? 'So lösen ihn die Empfänger ein: ' : 'So löst du ihn ein: ')
-    + 'In der App unter Konto › Deine Stufe › Gutscheincode bei dem Angebot eintragen, das gewünscht ist (Mittel oder Voll), „Code prüfen“ antippen und dann ' + (frei ? '„Code einlösen“.' : 'wie gewohnt bezahlen. Der Preis steht dann mit Rabatt da.') + '\n\n'
-    + 'Bitte gib den Code nur weiter, wenn das so gedacht ist.';
+    + 'In der App unter Konto › Deine Stufe › Gutscheincode bei dem Angebot eintragen, das gewünscht ist (Mittel oder Voll), „Code prüfen“ antippen und dann ' + (frei ? '„Code einlösen“.' : 'wie gewohnt bezahlen. Der Preis steht dann mit Rabatt da.');
 }
 
 async function gutscheinListe(request, env, db, jetzt) {
