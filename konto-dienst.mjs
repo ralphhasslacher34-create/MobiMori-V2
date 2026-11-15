@@ -50,6 +50,9 @@
  * 13f-9 (seit 2.0.84): Beim Anlegen eines Codes kann der Admin eine E-Mail-Adresse des Empfängers eintragen (Feld „empfaenger“, freiwillig). Persönlicher Code (Grenze 1): Mail an die Person,
  *      die ihn einlösen soll. Code für viele (Grenze über 1): Mail an den, der ihn verteilt. Die Adresse wird nicht gespeichert. Die Antwort meldet „mail“ (true oder false);
  *      der Code ist auch ohne Mail angelegt. Keine neue SQL-Zeile.
+ * 13f-10 (seit 2.0.88, Routenplanung): POST /route/planen. Der Dienst prüft Anmeldung und Stufe, zählt die Route (eigene Zahl, getrennt von den Online-Checks: Testwoche 10, Mittel 100, Voll 1000 im Jahr,
+ *      Nachkauf 100 Routen für 9,99 €), ruft HERE Routing v8 (Truck) mit den Maßen und Gewichten des Fahrzeugs auf und gibt Punkte, Länge, Dauer und Warnungen zurück. Der HERE-Schlüssel
+ *      (Secret HERE_SCHLUESSEL) bleibt im Dienst. Schlägt HERE fehl oder findet keine Route, wird nicht gezählt. Zwei neue Tabellen (13f-10.sql: route_nutzung, route_extra).
  * 13e-5 (seit 2.0.73): Rollen-Tabelle „rolle“ (E-Mail, Name, Funktion Admin oder Entwickler). Die App erkennt daran den Bereich „Nur für Entwickler“;
  *      die Tabelle ändern nur Admins (GET /rolle/liste, POST /rolle/setzen, POST /rolle/entfernen). Eine SQL-Zeile (13e-5.sql), dazu der erste Admin von Hand.
  * 13e-4 (seit 2.0.72): Bezahlung. Zwei Wege: PayPal (der Dienst legt die Bestellung bei PayPal an, nach dem Bezahlen schließt er sie ab und schaltet sofort frei)
@@ -59,7 +62,7 @@
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13f-9';
+export const VERSION = '13f-10';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -1369,12 +1372,15 @@ async function gesundheit(env) {
   /* Bezahlung (13e-4): die Tabellen und was im Worker eingetragen ist. Es steht nur „ja“ oder „nein“ da, nie ein Wert. */
   let bezTabellen = false;
   try { const db = datenbank(env); for (const t of ['bestellung', 'beleg', 'check_extra', 'erinnerung', 'zaehler']) await db.prepare('SELECT 1 FROM ' + t + ' LIMIT 1').first(); bezTabellen = true; } catch (e) { bezTabellen = false; }
+  let routenTab = false;
+  try { const db = datenbank(env); await db.prepare('SELECT 1 FROM route_nutzung LIMIT 1').first(); await db.prepare('SELECT 1 FROM route_extra LIMIT 1').first(); routenTab = true; } catch (e) { routenTab = false; }
   let gutscheine = false;
   try { const db = datenbank(env); await db.prepare('SELECT 1 FROM gutschein LIMIT 1').first(); await db.prepare('SELECT 1 FROM gutschein_einloesung LIMIT 1').first(); await db.prepare('SELECT gutschein, liste_cent FROM bestellung LIMIT 1').first(); await db.prepare('SELECT gutschein, liste_cent FROM beleg LIMIT 1').first(); gutscheine = true; } catch (e) { gutscheine = false; }
   const bezahlung = { tabellen: bezTabellen, gutscheine, paypal: paypalEingerichtet(env), paypalEchtgeld: !!(env && env.PAYPAL_LIVE === '1'), ueberweisung: !!ueberweisungDaten(env), freischalten: !!adminToken(env), beleg: !!belegAnschrift(env) };
   return {
     ok: true, dienst: DIENST, version: VERSION,
     datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, rollen, verleih, mitnutzung, planung, stoerungsmail: true, waechter,
+    routen: { tabellen: routenTab, schluessel: !!(env && typeof env.HERE_SCHLUESSEL === 'string' && env.HERE_SCHLUESSEL.trim().length >= 8) },
     recherche: !!(env && typeof env.RECHERCHE_URL === 'string' && /^https:\/\//.test(env.RECHERCHE_URL) && typeof env.RECHERCHE_TOKEN === 'string' && env.RECHERCHE_TOKEN.length >= 8),
     pepper: typeof (env && env.PASSWORT_PEPPER) === 'string' && env.PASSWORT_PEPPER.length >= 32,
     mail: !!(env && env.EMAIL && env.ABSENDER),
@@ -1389,12 +1395,12 @@ async function gesundheit(env) {
 
 /* Die Zahlen sind Richtwerte (Nutzer, 12.11.2026). Sie stehen nur hier und in js/konto.js (ein Test vergleicht beide). */
 export const STUFEN = {
-  basic: { name: 'Basic', geraete: 2, checks: 0, fahrzeuge: 1, online: false },
-  test: { name: 'Testwoche', geraete: 4, checks: 1, fahrzeuge: 3, online: true },
-  mittel: { name: 'Mittel', geraete: 4, checks: 3, fahrzeuge: 3, online: true },
-  voll: { name: 'Voll', geraete: 10, checks: 10, fahrzeuge: null, online: true },
+  basic: { name: 'Basic', geraete: 2, checks: 0, routen: 0, fahrzeuge: 1, online: false },
+  test: { name: 'Testwoche', geraete: 4, checks: 1, routen: 10, fahrzeuge: 3, online: true },
+  mittel: { name: 'Mittel', geraete: 4, checks: 3, routen: 100, fahrzeuge: 3, online: true },
+  voll: { name: 'Voll', geraete: 10, checks: 10, routen: 1000, fahrzeuge: null, online: true },
   /* Nur für den Entwickler, nur per SQL setzbar, keine Grenzen (null = unbegrenzt). Nur die Bremse gegen zu viele Checks hintereinander bleibt. */
-  entwickler: { name: 'Entwickler', geraete: null, checks: null, fahrzeuge: null, online: true }
+  entwickler: { name: 'Entwickler', geraete: null, checks: null, routen: null, fahrzeuge: null, online: true }
 };
 export const TESTWOCHE_TAGE = 7;
 export const CHECK_ZEITRAUM_TAGE = 365;
@@ -1431,6 +1437,7 @@ async function testwocheStarten(db, env, nutzerId, email, jetzt) {
 }
 
 async function checksAufraeumen(db, jetzt) {
+  try { await db.prepare('DELETE FROM route_nutzung WHERE am <= ? OR (status = ? AND am <= ?)').bind(jetzt - (CHECK_ZEITRAUM_TAGE + 35) * TAG, 'laeuft', jetzt - 1 * TAG).run(); } catch (e) { if (!fehltTabelle(e)) throw e; }
   try {
     await db.batch([
       db.prepare('DELETE FROM check_nutzung WHERE am <= ?').bind(jetzt - (CHECK_ZEITRAUM_TAGE + 35) * TAG),
@@ -1465,17 +1472,202 @@ async function extraZurueck(db, nutzerId) {
   try { await db.prepare('UPDATE check_extra SET anzahl = anzahl + 1 WHERE nutzer_id = ?').bind(nutzerId).run(); } catch (e) { /* nächster Versuch beim Support */ }
 }
 
+/* ---------- 13f-10: Routenplanung (seit 2.0.88) ---------- */
+
+/* Zählung wie bei den Online-Checks, aber getrennt davon (Tabellen route_nutzung und route_extra). Fehlen die Tabellen, gibt es nichts Gezähltes und nichts Nachgekauftes. */
+async function routenGenutzt(db, dr, stufeId, jetzt) {
+  try {
+    const klasse = stufeId === 'test' ? ['test'] : (stufeId === 'entwickler' ? ['entwickler'] : ['mittel', 'voll']);
+    const z = await db.prepare('SELECT COUNT(*) AS n FROM route_nutzung WHERE datenraum_id = ? AND am > ? AND status IN (?, ?) AND stufe IN (?, ?)')
+      .bind(dr, jetzt - CHECK_ZEITRAUM_TAGE * TAG, 'laeuft', 'ok', klasse[0], klasse[1] || klasse[0]).first();
+    return z ? z.n : 0;
+  } catch (e) { if (fehltTabelle(e)) return 0; throw e; }
+}
+async function routenExtraFrei(db, nutzerId) {
+  try {
+    const z = await db.prepare('SELECT anzahl FROM route_extra WHERE nutzer_id = ?').bind(nutzerId).first();
+    return z ? z.anzahl : 0;
+  } catch (e) { if (fehltTabelle(e)) return 0; throw e; }
+}
+async function routenExtraNehmen(db, nutzerId) {
+  try {
+    const r = await db.prepare('UPDATE route_extra SET anzahl = anzahl - 1 WHERE nutzer_id = ? AND anzahl > 0').bind(nutzerId).run();
+    return !!(r && r.meta && r.meta.changes === 1);
+  } catch (e) { if (fehltTabelle(e)) return false; throw e; }
+}
+async function routenExtraZurueck(db, nutzerId) {
+  try { await db.prepare('UPDATE route_extra SET anzahl = anzahl + 1 WHERE nutzer_id = ?').bind(nutzerId).run(); } catch (e) { /* nächster Versuch beim Support */ }
+}
+
+const HERE_URL = 'https://router.hereapi.com/v8/routes';
+const ZEIT_HERE_MS = 30 * 1000;
+const MAX_VIA = 5;
+const MAX_ROUTE_PUNKTE = 3000;
+
+/* Die Positionen aus der Anfrage: { breite, laenge } oder Fehler. */
+function routePunkt(p, feld) {
+  const b = p && typeof p === 'object' ? Number(p.breite) : NaN, l = p && typeof p === 'object' ? Number(p.laenge) : NaN;
+  if (!(b >= -90 && b <= 90) || !(l >= -180 && l <= 180) || (p.breite === null || p.laenge === null)) throw new HttpFehler(400, 'Die Position von ' + feld + ' fehlt oder ist ungültig.', { feld });
+  return { breite: Math.round(b * 100000) / 100000, laenge: Math.round(l * 100000) / 100000 };
+}
+/* Maße in Metern, Gewichte in Kilogramm (Angaben aus dem Fahrzeug). HERE rechnet Maße in Zentimetern. Fehlende Angaben bleiben weg. */
+function routeFahrzeug(f) {
+  const q = f && typeof f === 'object' ? f : {};
+  const z = (v, min, max) => { const n = Number(v); return v !== null && v !== undefined && v !== '' && isFinite(n) && n >= min && n <= max ? n : null; };
+  const o = { hoehe: z(q.hoehe, 0.5, 6), breite: z(q.breite, 0.5, 5), laenge: z(q.laenge, 1, 40), gesamtgewicht: z(q.gesamtgewicht, 100, 100000), achslast: z(q.achslast, 100, 30000), achsen: z(q.achsen, 1, 10) };
+  return o;
+}
+
+/* HERE liefert die Linie als „flexible polyline“. Dekodieren ohne Zusatzpaket (2D, die Höhe wird übersprungen). */
+export function polylineDekodieren(text) {
+  const tab = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const pos = { i: 0 };
+  const wert = () => {
+    let r = 0, schub = 0, c;
+    for (;;) {
+      if (pos.i >= text.length) throw new Error('Linie unvollständig');
+      c = tab.indexOf(text[pos.i++]);
+      if (c < 0) throw new Error('Linie ungültig');
+      r |= (c & 31) << schub; schub += 5;
+      if (!(c & 32)) break;
+    }
+    return r;
+  };
+  const vz = (n) => (n & 1 ? ~(n >> 1) : n >> 1);
+  const kopf = wert(); if (kopf !== 1) throw new Error('Linienformat unbekannt');
+  const bits = wert();
+  const genau = bits & 15, dritte = (bits >> 4) & 7;
+  const f = Math.pow(10, genau);
+  const aus = [];
+  let b = 0, l = 0;
+  while (pos.i < text.length) {
+    b += vz(wert()); l += vz(wert());
+    if (dritte) wert();
+    aus.push({ breite: b / f, laenge: l / f });
+  }
+  return aus;
+}
+
+function ausduennen(punkte, max) {
+  if (punkte.length <= max) return punkte;
+  const schritt = (punkte.length - 1) / (max - 1);
+  const r = [];
+  for (let i = 0; i < max; i++) r.push(punkte[Math.round(i * schritt)]);
+  return r;
+}
+
+/* Aus der Antwort von HERE: Punkte, Länge (km), Dauer (Minuten), Warnungen. Wirft HttpFehler, wenn es keine Route gibt. */
+export function routeAuswerten(j) {
+  const route = j && Array.isArray(j.routes) ? j.routes[0] : null;
+  if (!route || !Array.isArray(route.sections) || !route.sections.length) {
+    const nr = j && Array.isArray(j.notices) && j.notices.some((n) => n && n.code === 'noRouteFound');
+    throw new HttpFehler(404, nr || (j && j.routes) ? 'Zwischen diesen Orten wurde keine Route für dieses Fahrzeug gefunden. Dieser Versuch wurde nicht gezählt.' : 'Der Routen-Dienst hat keine Route geliefert. Dieser Versuch wurde nicht gezählt.');
+  }
+  let punkte = [], meter = 0, sek = 0;
+  const warnungen = [], gesehen = {};
+  for (const s of route.sections) {
+    if (typeof s.polyline !== 'string') continue;
+    const basis = punkte.length;
+    let pl;
+    try { pl = polylineDekodieren(s.polyline); } catch (e) { throw new HttpFehler(502, 'Die Route des Routen-Dienstes ist nicht lesbar. Dieser Versuch wurde nicht gezählt.'); }
+    punkte = punkte.concat(pl);
+    if (s.summary) { meter += Number(s.summary.length) || 0; sek += Number(s.summary.duration) || 0; }
+    const notices = Array.isArray(s.notices) ? s.notices : [];
+    const spans = Array.isArray(s.spans) ? s.spans : [];
+    notices.forEach((n, idx) => {
+      if (!n || typeof n !== 'object') return;
+      const code = String(n.code || ''), stufe = n.severity === 'critical' ? 'kritisch' : 'hinweis';
+      if (code === 'noRouteFound') return;
+      let ort = null;
+      for (const sp of spans) { if (Array.isArray(sp.notices) && sp.notices.includes(idx) && typeof sp.offset === 'number' && pl[sp.offset]) { ort = pl[sp.offset]; break; } }
+      const schl = code + ':' + stufe + ':' + (ort ? ort.breite.toFixed(3) + ',' + ort.laenge.toFixed(3) : '');
+      if (gesehen[schl]) return; gesehen[schl] = 1;
+      const einzel = Array.isArray(n.details) ? n.details.map((d) => d && typeof d.cause === 'string' ? d.cause : '').filter(Boolean)[0] : '';
+      warnungen.push({ code: code.slice(0, 60), stufe, titel: String(n.title || '').slice(0, 160), grund: String(einzel || '').slice(0, 200), ort });
+    });
+  }
+  if (punkte.length < 2) throw new HttpFehler(502, 'Der Routen-Dienst hat keine Linie geliefert. Dieser Versuch wurde nicht gezählt.');
+  return { punkte: ausduennen(punkte, MAX_ROUTE_PUNKTE).map((p) => ({ breite: Math.round(p.breite * 100000) / 100000, laenge: Math.round(p.laenge * 100000) / 100000 })),
+    laengeKm: Math.round(meter / 10) / 100, dauerMin: Math.round(sek / 60), warnungen: warnungen.slice(0, 30) };
+}
+
+/* Eine Route planen: Anmeldung, Stufe und Kontingent prüfen, zählen, HERE fragen. Schlägt HERE fehl oder gibt es keine Route, wird nicht gezählt. */
+async function routePlanen(request, env, db, jetzt, optionen) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request, 32 * 1024);
+  const von = routePunkt(b.von, 'von'), nach = routePunkt(b.nach, 'nach');
+  const via = (Array.isArray(b.via) ? b.via : []).slice(0, MAX_VIA).map((p, i) => routePunkt(p, 'via'));
+  if (Array.isArray(b.via) && b.via.length > MAX_VIA) throw new HttpFehler(400, 'Es sind höchstens ' + MAX_VIA + ' Zwischenziele möglich.', { feld: 'via' });
+  const fz = routeFahrzeug(b.fahrzeug);
+  if (!a.datenraumId) throw new HttpFehler(400, 'Zu diesem Konto gehört noch kein Datenraum.');
+  const st = await stufeVon(db, a.id, jetzt, false);
+  if (!st.grenzen.online || st.grenzen.routen === 0) throw new HttpFehler(402, 'Die Routenplanung gibt es ab der Stufe Mittel oder in der Testwoche. Deine Stufe ist ' + st.name + '.', { stufe: st.id });
+  const schluessel = env && typeof env.HERE_SCHLUESSEL === 'string' ? env.HERE_SCHLUESSEL.trim() : '';
+  if (schluessel.length < 8) throw new HttpFehler(503, 'Der Routen-Dienst ist im Konto-Dienst noch nicht eingetragen.');
+  await bremsen(db, await schluesselFuer('rte', a.datenraumId), 10, 10 * MINUTE, jetzt, 'Es wurden zu viele Routen hintereinander geplant.');
+  const genutzt = await routenGenutzt(db, a.datenraumId, st.id, jetzt);
+  let extraGenommen = false;
+  if (st.grenzen.routen !== null && genutzt >= st.grenzen.routen) {
+    extraGenommen = await routenExtraNehmen(db, a.id);
+    if (!extraGenommen) throw new HttpFehler(402, 'Dein Kontingent ist aufgebraucht: ' + genutzt + ' von ' + st.grenzen.routen + ' geplanten Routen in den letzten 12 Monaten. Unter Konto kannst du 100 zusätzliche Routen kaufen.', { genutzt, grenze: st.grenzen.routen, stufe: st.id });
+  }
+  const nid = crypto.randomUUID();
+  try {
+    await db.prepare('INSERT INTO route_nutzung (id, datenraum_id, stufe, am, status) VALUES (?, ?, ?, ?, ?)').bind(nid, a.datenraumId, extraGenommen ? 'extra' : st.id, jetzt, 'laeuft').run();
+  } catch (e) { if (extraGenommen) await routenExtraZurueck(db, a.id); throw e; }
+  async function zurueck() {
+    try { await db.prepare('DELETE FROM route_nutzung WHERE id = ?').bind(nid).run(); } catch (e) { /* wird später aufgeräumt */ }
+    if (extraGenommen) await routenExtraZurueck(db, a.id);
+  }
+  const pt = (p) => p.breite + ',' + p.laenge;
+  const q = ['transportMode=truck', 'origin=' + pt(von), 'destination=' + pt(nach), 'return=polyline,summary', 'spans=notices', 'lang=de'];
+  via.forEach((p) => q.push('via=' + pt(p)));
+  if (fz.hoehe !== null) q.push('vehicle[height]=' + Math.round(fz.hoehe * 100));
+  if (fz.breite !== null) q.push('vehicle[width]=' + Math.round(fz.breite * 100));
+  if (fz.laenge !== null) q.push('vehicle[length]=' + Math.round(fz.laenge * 100));
+  if (fz.gesamtgewicht !== null) q.push('vehicle[grossWeight]=' + Math.round(fz.gesamtgewicht));
+  if (fz.achslast !== null) q.push('vehicle[weightPerAxle]=' + Math.round(fz.achslast));
+  if (fz.achsen !== null) q.push('vehicle[axleCount]=' + Math.round(fz.achsen));
+  const holen = (optionen && optionen.fetch) || fetch;
+  let r, text;
+  try {
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), ZEIT_HERE_MS) : null;
+    try {
+      r = await holen(HERE_URL + '?' + q.join('&') + '&apiKey=' + encodeURIComponent(schluessel), { method: 'GET', signal: ctl ? ctl.signal : undefined });
+      text = await r.text();
+    } finally { if (timer) clearTimeout(timer); }
+  } catch (e) {
+    await zurueck();
+    throw new HttpFehler(502, 'Der Routen-Dienst hat nicht rechtzeitig geantwortet. Dieser Versuch wurde nicht gezählt.');
+  }
+  let j = null;
+  try { j = JSON.parse(text); } catch (e) { j = null; }
+  if (!r.ok || !j || typeof j !== 'object') {
+    await zurueck();
+    throw new HttpFehler(502, 'Der Routen-Dienst konnte die Route nicht berechnen (Antwort ' + (r && r.status) + '). Dieser Versuch wurde nicht gezählt.');
+  }
+  let erg;
+  try { erg = routeAuswerten(j); } catch (e) { await zurueck(); throw e; }
+  await db.prepare('UPDATE route_nutzung SET status = ? WHERE id = ?').bind('ok', nid).run();
+  const kontingent = { genutzt: extraGenommen ? genutzt : genutzt + 1, grenze: st.grenzen.routen, stufe: st.id };
+  if (extraGenommen) kontingent.extraFrei = await routenExtraFrei(db, a.id);
+  return { ok: true, route: erg, kontingent, fahrzeugAngaben: fz };
+}
+
 async function kontoStufe(request, env, db, jetzt) {
   const a = await authentifizieren(request, db, jetzt);
   const st = await stufeVon(db, a.id, jetzt, false);
   const g = st.grenzen;
   const geraete = await db.prepare('SELECT COUNT(*) AS n FROM sitzung WHERE nutzer_id = ? AND laeuft_ab > ?').bind(a.id, jetzt).first();
   const genutzt = a.datenraumId && g.online ? await checksGenutzt(db, a.datenraumId, st.id, jetzt) : 0;
+  const routen = { genutzt: a.datenraumId && g.online ? await routenGenutzt(db, a.datenraumId, st.id, jetzt) : 0, extra: await routenExtraFrei(db, a.id) };
   return {
     ok: true,
     stufe: { id: st.id, name: st.name, bis: st.bis },
-    grenzen: { geraete: g.geraete, checks: g.checks, fahrzeuge: g.fahrzeuge, online: g.online },
-    nutzung: { geraete: geraete ? geraete.n : 0, checks: genutzt, checksFrei: g.checks === null ? null : Math.max(0, g.checks - genutzt), zeitraumTage: CHECK_ZEITRAUM_TAGE, extra: await extraFrei(db, a.id) },
+    grenzen: { geraete: g.geraete, checks: g.checks, routen: g.routen, fahrzeuge: g.fahrzeuge, online: g.online },
+    nutzung: { geraete: geraete ? geraete.n : 0, checks: genutzt, checksFrei: g.checks === null ? null : Math.max(0, g.checks - genutzt), zeitraumTage: CHECK_ZEITRAUM_TAGE, extra: await extraFrei(db, a.id),
+      routen: routen.genutzt, routenFrei: g.routen === null ? null : Math.max(0, g.routen - routen.genutzt), routenExtra: routen.extra },
     rolle: await rolleVon(db, a.email)
   };
 }
@@ -1701,6 +1893,7 @@ export async function behandeln(request, env, optionen) {
       'POST /rolle/setzen': rolleSetzen,
       'POST /rolle/entfernen': rolleEntfernen,
       'POST /check/senden': checkSenden,
+      'POST /route/planen': routePlanen,
       'POST /bezahlen/starten': bezahlenStarten,
       'POST /gutschein/pruefen': gutscheinPruefen,
       'POST /gutschein/einloesen': gutscheinEinloesen,
@@ -1739,7 +1932,8 @@ export async function behandeln(request, env, optionen) {
 export const PRODUKTE = {
   mittel: { name: 'MobiMory Mittel, Nutzung für ein Jahr', kurz: 'Mittel (ein Jahr)', cent: 5988, art: 'stufe', stufe: 'mittel' },
   voll: { name: 'MobiMory Voll, Nutzung für ein Jahr', kurz: 'Voll (ein Jahr)', cent: 11988, art: 'stufe', stufe: 'voll' },
-  recherche5: { name: '5 zusätzliche Online-Recherchen', kurz: '5 Recherchen', cent: 999, art: 'checks', anzahl: 5 }
+  recherche5: { name: '5 zusätzliche Online-Recherchen', kurz: '5 Recherchen', cent: 999, art: 'checks', anzahl: 5 },
+  route100: { name: '100 zusätzliche Routen', kurz: '100 Routen', cent: 999, art: 'routen', anzahl: 100 }
 };
 const ERINNERUNG_TAGE = [30, 7];
 const LINK_TAGE = 45;
@@ -1796,6 +1990,7 @@ async function bestellPruefen(db, nutzerId, produktId, jetzt) {
   const p = PRODUKTE[produktId];
   if (p.art === 'stufe' && p.stufe === 'mittel' && st.id === 'voll') throw new HttpFehler(400, 'Du hast bereits Voll' + (st.bis ? ' (bis ' + datumDe(st.bis) + ')' : '') + '. Mittel kannst du nach dem Ablauf kaufen.');
   if (p.art === 'checks' && !st.grenzen.online) throw new HttpFehler(400, 'Zusätzliche Recherchen gibt es ab der Stufe Mittel oder in der Testwoche.');
+  if (p.art === 'routen' && !st.grenzen.online) throw new HttpFehler(400, 'Zusätzliche Routen gibt es ab der Stufe Mittel oder in der Testwoche.');
   return st;
 }
 
@@ -1875,6 +2070,8 @@ async function bestellungAbschliessen(env, db, best, weg, referenz, jetzt) {
       bis = plusJahr(verlaengern ? s.gueltig_bis : jetzt);
       liste.push(db.prepare('INSERT OR REPLACE INTO stufe_konto (nutzer_id, stufe, gueltig_bis, geaendert_am) VALUES (?, ?, ?, ?)').bind(best.nutzer_id, p.stufe, bis, jetzt));
     }
+  } else if (p.art === 'routen') {
+    liste.push(db.prepare('INSERT INTO route_extra (nutzer_id, anzahl) VALUES (?, ?) ON CONFLICT(nutzer_id) DO UPDATE SET anzahl = anzahl + excluded.anzahl').bind(best.nutzer_id, p.anzahl));
   } else {
     liste.push(db.prepare('INSERT INTO check_extra (nutzer_id, anzahl) VALUES (?, ?) ON CONFLICT(nutzer_id) DO UPDATE SET anzahl = anzahl + excluded.anzahl').bind(best.nutzer_id, p.anzahl));
   }
@@ -1899,6 +2096,7 @@ function belegText(b) {
   z.push('Leistung: ' + p.name + (p.art === 'stufe' && b.bis ? ' (Zeitraum ' + datumDe(b.am) + ' bis ' + datumDe(b.bis) + ')' : ' (Leistungszeitpunkt ' + datumDe(b.am) + ')') + rabattZeilen(b) + '\nBetrag: ' + centText(b.cent) + '\nBezahlt per ' + (b.weg === 'paypal' ? 'PayPal' : 'Überweisung') + ', Zahlungsreferenz ' + b.referenz);
   z.push('Gemäß § 19 UStG wird keine Umsatzsteuer berechnet.');
   if (p.art === 'stufe') z.push('Deine Stufe ' + p.stufe.charAt(0).toUpperCase() + p.stufe.slice(1) + (b.bis ? ' gilt jetzt bis ' + datumDe(b.bis) : ' ist freigeschaltet') + '. Es ist kein Abo: Es wird nichts automatisch abgebucht. Vor dem Ablauf bekommst du eine Erinnerung.');
+  else if (p.art === 'routen') z.push('Die ' + p.anzahl + ' Routen sind deinem Konto gutgeschrieben. Sie werden benutzt, wenn dein Kontingent an Routen aufgebraucht ist.');
   else z.push('Die ' + p.anzahl + ' Recherchen sind deinem Konto gutgeschrieben. Sie werden benutzt, wenn dein Kontingent aufgebraucht ist.');
   z.push('Bitte hebe diese Mail als Beleg auf.');
   return z.join('\n\n');
@@ -1981,7 +2179,7 @@ async function istNeukunde(db, a) {
 /* Rabattcode (1 bis 25 %) für ein Angebot: rechnet den Preis. Wirft, wenn der Code hier nicht gilt. */
 async function gutscheinRabatt(db, a, g, produktId) {
   const p = PRODUKTE[produktId];
-  if (p.art !== 'stufe') throw new HttpFehler(400, 'Der Rabattcode gilt nicht für zusätzliche Recherchen, nur für den ersten Kauf von Mittel oder Voll.', { feld: 'code' });
+  if (p.art !== 'stufe') throw new HttpFehler(400, 'Der Rabattcode gilt nicht für zusätzliche Recherchen und Routen, nur für den ersten Kauf von Mittel oder Voll.', { feld: 'code' });
   if (!(await istNeukunde(db, a))) throw new HttpFehler(400, 'Dieser Rabattcode gilt nur für Neukunden beim ersten Kauf. Beim Verlängern, beim Wechsel von Mittel auf Voll und bei Recherchen gibt es keinen Rabatt.', { feld: 'code' });
   const rabattCent = Math.round(p.cent * g.prozent / 100);
   return { code: g.code, prozent: g.prozent, listeCent: p.cent, rabattCent, zahlCent: p.cent - rabattCent };
@@ -2142,7 +2340,8 @@ function gutscheinMailText(g) {
     + 'Das bewirkt er: ' + was + '.\n'
     + 'Er gilt bis ' + datumDe(g.ablauf) + (viele ? ' und kann ' + g.grenze + '-mal eingelöst werden (je Konto einmal).' : ' und kann einmal eingelöst werden.') + '\n\n'
     + (viele ? 'So lösen ihn die Empfänger ein: ' : 'So löst du ihn ein: ')
-    + 'In der App unter Konto › Deine Stufe › Gutscheincode bei dem Angebot eintragen, das gewünscht ist (Mittel oder Voll), „Code prüfen“ antippen und dann ' + (frei ? '„Code einlösen“.' : 'wie gewohnt bezahlen. Der Preis steht dann mit Rabatt da.');
+    + 'In der App unter Konto › Deine Stufe › Gutscheincode bei dem Angebot eintragen, das gewünscht ist (Mittel oder Voll), „Code prüfen“ antippen und dann ' + (frei ? '„Code einlösen“.' : 'wie gewohnt bezahlen. Der Preis steht dann mit Rabatt da.') + '\n\n'
+    + 'Bitte gib den Code nur weiter, wenn das so gedacht ist.';
 }
 
 async function gutscheinListe(request, env, db, jetzt) {
@@ -2325,7 +2524,7 @@ const FREISCHALT_SEITE = '<!doctype html><html lang="de"><head><meta charset="ut
   + '<p><button id="laden">Offene Überweisungen laden</button></p><p class="m" id="meldung" role="status"></p><div id="liste"></div>'
   + '<h2>Direkt freischalten</h2><p>Wenn Geld ohne Bestellung in der App eingegangen ist.</p>'
   + '<p><label>E-Mail des Kontos<br><input type="email" id="mail"></label></p>'
-  + '<p><label>Angebot<br><select id="prod"><option value="mittel">Mittel, ein Jahr</option><option value="voll">Voll, ein Jahr</option><option value="recherche5">5 Recherchen</option></select></label></p>'
+  + '<p><label>Angebot<br><select id="prod"><option value="mittel">Mittel, ein Jahr</option><option value="voll">Voll, ein Jahr</option><option value="recherche5">5 Recherchen</option><option value="route100">100 Routen</option></select></label></p>'
   + '<p><button id="direkt">Geld ist da: freischalten</button></p>'
   + '<script>(function(){var $=function(i){return document.getElementById(i)};function senden(pfad,body){return fetch(pfad,{method:"POST",headers:{"Content-Type":"application/json",Authorization:"Bearer "+$("pw").value},body:JSON.stringify(body||{})}).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j&&j.error||("Fehler "+r.status));return j})})}'
   + 'function fehler(e){$("meldung").textContent=String(e&&e.message||e)}'
