@@ -41,8 +41,12 @@
  *      im Fahrzeug des Besitzers (mit Namen des Gastes) und erzeugt Kontroll-Codes. Dokumente lassen sich je Freigabe ausnehmen. Drei neue Spalten in „freigabe“ (13f-2.sql).
  * 13f-3 (seit 2.0.76, Bau 2 Störung): Meldet ein Gast mit „mitnutzen“ eine Störung, bekommt der Besitzer eine Info-Mail (nur zur Information, ohne Antwortfunktion, höchstens 5 je Freigabe und Stunde).
  *      Der Gast sieht dazu die früheren Störungen und Arbeiten des Fahrzeugs (nur Texte, keine Beträge), damit die App ähnliche frühere Fälle zeigen kann. Keine neue SQL-Zeile.
- * 13f-4 (seit 2.0.78, Bau 3 Planung): Zwei Zeiträume je Freigabe. Ab „plan_ab“ sieht der Gast das Fahrzeug, plant und macht Reisechecks (sie zählen zum Kontingent des Besitzers),
+ * 13f-4 (seit 2.0.79, Bau 3 Planung): Zwei Zeiträume je Freigabe. Ab „plan_ab“ sieht der Gast das Fahrzeug, plant und macht Reisechecks (sie zählen zum Kontingent des Besitzers),
  *      trägt aber nichts im Fahrzeug ein. Erst ab „ab_am“ gelten seine Rechte (13f-2). Eine neue Spalte in „freigabe“ (13f-4.sql).
+ * 13f-8 (seit 2.0.83, Bau 2 Gutscheincodes): Codes beim Bezahlen (PayPal und Überweisung). Rabatt 1 bis 25 % nur für Neukunden beim ersten Kauf (Code für viele mit Obergrenze oder persönlich),
+ *      oder genau 100 % als persönlicher Code (Grenze 1): schaltet Mittel oder Voll für 1 bis 12 Monate ohne Zahlung frei, PayPal wird dann nicht aufgerufen. Jeder Code hat ein Ablaufdatum.
+ *      Nur Admins legen Codes an (POST /gutschein/anlegen, GET /gutschein/liste, POST /gutschein/loeschen). Kunden: POST /gutschein/pruefen, POST /gutschein/einloesen.
+ *      Zwei neue Tabellen und vier neue Spalten (13f-8.sql). Der Beleg weist den Rabatt als eigene Zeile aus.
  * 13e-5 (seit 2.0.73): Rollen-Tabelle „rolle“ (E-Mail, Name, Funktion Admin oder Entwickler). Die App erkennt daran den Bereich „Nur für Entwickler“;
  *      die Tabelle ändern nur Admins (GET /rolle/liste, POST /rolle/setzen, POST /rolle/entfernen). Eine SQL-Zeile (13e-5.sql), dazu der erste Admin von Hand.
  * 13e-4 (seit 2.0.72): Bezahlung. Zwei Wege: PayPal (der Dienst legt die Bestellung bei PayPal an, nach dem Bezahlen schließt er sie ab und schaltet sofort frei)
@@ -52,7 +56,7 @@
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13f-4';
+export const VERSION = '13f-8';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -1362,7 +1366,9 @@ async function gesundheit(env) {
   /* Bezahlung (13e-4): die Tabellen und was im Worker eingetragen ist. Es steht nur „ja“ oder „nein“ da, nie ein Wert. */
   let bezTabellen = false;
   try { const db = datenbank(env); for (const t of ['bestellung', 'beleg', 'check_extra', 'erinnerung', 'zaehler']) await db.prepare('SELECT 1 FROM ' + t + ' LIMIT 1').first(); bezTabellen = true; } catch (e) { bezTabellen = false; }
-  const bezahlung = { tabellen: bezTabellen, paypal: paypalEingerichtet(env), paypalEchtgeld: !!(env && env.PAYPAL_LIVE === '1'), ueberweisung: !!ueberweisungDaten(env), freischalten: !!adminToken(env), beleg: !!belegAnschrift(env) };
+  let gutscheine = false;
+  try { const db = datenbank(env); await db.prepare('SELECT 1 FROM gutschein LIMIT 1').first(); await db.prepare('SELECT 1 FROM gutschein_einloesung LIMIT 1').first(); await db.prepare('SELECT gutschein, liste_cent FROM bestellung LIMIT 1').first(); await db.prepare('SELECT gutschein, liste_cent FROM beleg LIMIT 1').first(); gutscheine = true; } catch (e) { gutscheine = false; }
+  const bezahlung = { tabellen: bezTabellen, gutscheine, paypal: paypalEingerichtet(env), paypalEchtgeld: !!(env && env.PAYPAL_LIVE === '1'), ueberweisung: !!ueberweisungDaten(env), freischalten: !!adminToken(env), beleg: !!belegAnschrift(env) };
   return {
     ok: true, dienst: DIENST, version: VERSION,
     datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, rollen, verleih, mitnutzung, planung, stoerungsmail: true, waechter,
@@ -1693,6 +1699,11 @@ export async function behandeln(request, env, optionen) {
       'POST /rolle/entfernen': rolleEntfernen,
       'POST /check/senden': checkSenden,
       'POST /bezahlen/starten': bezahlenStarten,
+      'POST /gutschein/pruefen': gutscheinPruefen,
+      'POST /gutschein/einloesen': gutscheinEinloesen,
+      'POST /gutschein/anlegen': gutscheinAnlegen,
+      'GET /gutschein/liste': gutscheinListe,
+      'POST /gutschein/loeschen': gutscheinLoeschen,
       'GET /bezahlen/paypal/zurueck': paypalZurueck,
       'GET /bezahlen/paypal/abbruch': paypalAbbruch,
       'GET /bezahlen/verlaengern': verlaengernLink,
@@ -1785,22 +1796,29 @@ async function bestellPruefen(db, nutzerId, produktId, jetzt) {
   return st;
 }
 
-async function bestellungAnlegen(db, nutzer, produktId, weg, jetzt) {
+async function bestellungAnlegen(db, nutzer, produktId, weg, jetzt, gs) {
   const p = PRODUKTE[produktId];
   const id = 'MM-' + zufallCode(8);
+  if (gs) {
+    /* Mit Gutscheincode (13f-8): bezahlt wird der Preis nach Abzug, der Listenpreis und der Code bleiben an der Bestellung. */
+    await gutscheinSchutz(() => db.prepare('INSERT INTO bestellung (id, nutzer_id, email, produkt, cent, weg, paypal_id, erstellt_am, gutschein, liste_cent) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)')
+      .bind(id, nutzer.id, nutzer.email, produktId, gs.zahlCent, weg, jetzt, gs.code, p.cent).run());
+    return id;
+  }
   await db.prepare('INSERT INTO bestellung (id, nutzer_id, email, produkt, cent, weg, paypal_id, erstellt_am) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)').bind(id, nutzer.id, nutzer.email, produktId, p.cent, weg, jetzt).run();
   return id;
 }
 
 /* Legt bei PayPal eine Bestellung an und gibt die Adresse zurück, zu der der Kunde zum Bezahlen geht. */
-async function paypalBestellen(env, db, nutzer, produktId, jetzt, optionen) {
+async function paypalBestellen(env, db, nutzer, produktId, jetzt, optionen, gs) {
   if (!paypalEingerichtet(env)) throw new HttpFehler(503, 'Das Bezahlen mit PayPal ist im Dienst noch nicht eingerichtet.');
   await bestellPruefen(db, nutzer.id, produktId, jetzt);
   await bremsen(db, await schluesselFuer('bez', nutzer.id), 10, 60 * MINUTE, jetzt, 'Es wurden zu viele Bestellungen hintereinander angelegt.');
   const holen = (optionen && optionen.fetch) || fetch;
   const token = await paypalToken(env, holen);
   const p = PRODUKTE[produktId];
-  const bid = await bestellungAnlegen(db, nutzer, produktId, 'paypal', jetzt);
+  const cent = gs ? gs.zahlCent : p.cent;
+  const bid = await bestellungAnlegen(db, nutzer, produktId, 'paypal', jetzt, gs);
   async function weg() { try { await db.prepare('DELETE FROM bestellung WHERE id = ?').bind(bid).run(); } catch (e) { /* wird später aufgeräumt */ } }
   let r, j = null;
   try {
@@ -1809,7 +1827,7 @@ async function paypalBestellen(env, db, nutzer, produktId, jetzt, optionen) {
       headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', 'PayPal-Request-Id': bid },
       body: JSON.stringify({
         intent: 'CAPTURE',
-        purchase_units: [{ reference_id: bid, custom_id: bid, description: p.name, amount: { currency_code: 'EUR', value: centWert(p.cent) } }],
+        purchase_units: [{ reference_id: bid, custom_id: bid, description: p.name, amount: { currency_code: 'EUR', value: centWert(cent) } }],
         payment_source: { paypal: { experience_context: {
           brand_name: 'MobiMory', locale: 'de-DE', landing_page: 'LOGIN', shipping_preference: 'NO_SHIPPING', user_action: 'PAY_NOW',
           payment_method_preference: 'IMMEDIATE_PAYMENT_REQUIRED',
@@ -1835,7 +1853,17 @@ async function bestellungAbschliessen(env, db, best, weg, referenz, jetzt) {
   const jahr = new Date(jetzt).getUTCFullYear();
   const z = await db.prepare('INSERT INTO zaehler (schluessel, wert) VALUES (?, 1) ON CONFLICT(schluessel) DO UPDATE SET wert = wert + 1 RETURNING wert').bind('beleg:' + jahr).first();
   const nummer = 'MM-' + jahr + '-' + String(z.wert).padStart(4, '0');
-  const liste = [db.prepare('INSERT INTO beleg (nummer, am, email, produkt, cent, weg, referenz) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(nummer, jetzt, best.email, best.produkt, best.cent, weg, referenz)];
+  const gsCode = typeof best.gutschein === 'string' && best.gutschein ? best.gutschein : null;
+  let gsProzent = null;
+  if (gsCode) { try { const z = await db.prepare('SELECT prozent FROM gutschein WHERE code = ?').bind(gsCode).first(); gsProzent = z ? z.prozent : null; } catch (e) { gsProzent = null; } }
+  const liste = [gsCode
+    ? db.prepare('INSERT INTO beleg (nummer, am, email, produkt, cent, weg, referenz, gutschein, liste_cent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(nummer, jetzt, best.email, best.produkt, best.cent, weg, referenz, gsCode, best.liste_cent)
+    : db.prepare('INSERT INTO beleg (nummer, am, email, produkt, cent, weg, referenz) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(nummer, jetzt, best.email, best.produkt, best.cent, weg, referenz)];
+  if (gsCode) {
+    /* Zählt die Einlösung, aber nur einmal je Konto (zwei offene Bestellungen mit demselben Code zählen nicht doppelt). */
+    liste.push(db.prepare('UPDATE gutschein SET eingeloest = eingeloest + 1 WHERE code = ? AND NOT EXISTS (SELECT 1 FROM gutschein_einloesung WHERE code = ? AND nutzer_id = ?)').bind(gsCode, gsCode, best.nutzer_id));
+    liste.push(db.prepare('INSERT OR IGNORE INTO gutschein_einloesung (code, nutzer_id, am, art, referenz) VALUES (?, ?, ?, ?, ?)').bind(gsCode, best.nutzer_id, jetzt, 'rabatt', referenz));
+  }
   let bis = null;
   if (p.art === 'stufe') {
     const s = await db.prepare('SELECT stufe, gueltig_bis FROM stufe_konto WHERE nutzer_id = ?').bind(best.nutzer_id).first();
@@ -1849,8 +1877,14 @@ async function bestellungAbschliessen(env, db, best, weg, referenz, jetzt) {
   }
   liste.push(db.prepare('DELETE FROM bestellung WHERE id = ?').bind(best.id));
   await db.batch(liste);
-  try { await belegSenden(env, { nummer, am: jetzt, email: best.email, produkt: best.produkt, cent: best.cent, weg, referenz, bis }); } catch (e) { console.log('Beleg-Mail nicht gesendet: ' + String(e && e.message || e)); }
+  try { await belegSenden(env, { nummer, am: jetzt, email: best.email, produkt: best.produkt, cent: best.cent, weg, referenz, bis, gutschein: gsCode, listeCent: gsCode ? best.liste_cent : null, prozent: gsProzent }); } catch (e) { console.log('Beleg-Mail nicht gesendet: ' + String(e && e.message || e)); }
   return { nummer, neu: true, bis };
+}
+
+/* Der Rabatt steht auf dem Beleg als eigene Zeile (seit 2.0.83): Preis, Rabatt mit Code, dann der gezahlte Betrag. */
+function rabattZeilen(b) {
+  if (!b.gutschein || !(b.listeCent > b.cent)) return '';
+  return '\nPreis: ' + centText(b.listeCent) + '\nRabatt (Code ' + codeAnzeige(b.gutschein) + (b.prozent ? ', ' + prozentText(b.prozent / 100) : '') + '): −' + centText(b.listeCent - b.cent);
 }
 
 function belegText(b) {
@@ -1859,7 +1893,7 @@ function belegText(b) {
   z.push('Beleg (Rechnung) Nr. ' + b.nummer + '\nDatum: ' + datumDe(b.am));
   z.push('Leistender:\n' + (belegAnschrift(b.env) || 'Ralph Hasslacher, 74372 Sersheim'));
   z.push('Empfänger: ' + b.email);
-  z.push('Leistung: ' + p.name + (p.art === 'stufe' && b.bis ? ' (Zeitraum ' + datumDe(b.am) + ' bis ' + datumDe(b.bis) + ')' : ' (Leistungszeitpunkt ' + datumDe(b.am) + ')') + '\nBetrag: ' + centText(b.cent) + '\nBezahlt per ' + (b.weg === 'paypal' ? 'PayPal' : 'Überweisung') + ', Zahlungsreferenz ' + b.referenz);
+  z.push('Leistung: ' + p.name + (p.art === 'stufe' && b.bis ? ' (Zeitraum ' + datumDe(b.am) + ' bis ' + datumDe(b.bis) + ')' : ' (Leistungszeitpunkt ' + datumDe(b.am) + ')') + rabattZeilen(b) + '\nBetrag: ' + centText(b.cent) + '\nBezahlt per ' + (b.weg === 'paypal' ? 'PayPal' : 'Überweisung') + ', Zahlungsreferenz ' + b.referenz);
   z.push('Gemäß § 19 UStG wird keine Umsatzsteuer berechnet.');
   if (p.art === 'stufe') z.push('Deine Stufe ' + p.stufe.charAt(0).toUpperCase() + p.stufe.slice(1) + (b.bis ? ' gilt jetzt bis ' + datumDe(b.bis) : ' ist freigeschaltet') + '. Es ist kein Abo: Es wird nichts automatisch abgebucht. Vor dem Ablauf bekommst du eine Erinnerung.');
   else z.push('Die ' + p.anzahl + ' Recherchen sind deinem Konto gutgeschrieben. Sie werden benutzt, wenn dein Kontingent aufgebraucht ist.');
@@ -1872,6 +1906,232 @@ async function belegSenden(env, b) {
   await mailSenden(env, b.email, 'Dein Beleg Nr. ' + b.nummer + ' – MobiMory', text);
   const kopie = env && typeof env.BELEG_KOPIE === 'string' ? env.BELEG_KOPIE.trim() : '';
   if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(kopie)) { try { await mailSenden(env, kopie, 'Kopie Beleg ' + b.nummer, text); } catch (e) { /* die Kopie ist nur eine Hilfe */ } }
+}
+
+/* ---------- 13f-8: Gutscheincodes beim Bezahlen (seit 2.0.83) ---------- */
+
+/* Festlegung des Nutzers (15.11.2026):
+   - Der Code gilt bei PayPal und bei Überweisung.
+   - Rabatt: mehr als 0 bis 25 % stufenlos, oder genau 100 %. Alles dazwischen lehnt der Dienst ab (PayPal-Festgebühr).
+   - 1 bis 25 %: nur für Neukunden beim ersten Kauf (Konto hat nie bezahlt und nie Mittel oder Voll gehabt). Kein Rabatt bei Recherchen und beim Wechsel von Mittel auf Voll.
+     Ein Code für viele (mit Obergrenze) oder persönlich (Grenze 1).
+   - 100 %: nur persönlich (Grenze 1), auch für Bestandskunden (Geschenk). Gilt für Mittel oder Voll für 1 bis 12 Monate, ohne Zahlung, PayPal wird nicht aufgerufen.
+     Gleiche Stufe: die Laufzeit wird angehängt. Höhere Stufe schon da: Dienst lehnt ab. Mittel da und Code gibt Voll: Voll gilt ab sofort, der Rest von Mittel wird nicht angerechnet.
+   - Jeder Code hat ein Ablaufdatum. Nur Admins legen Codes an. */
+export const GUTSCHEIN_MAX_PROZENT = 25;
+const GUTSCHEIN_RANG = { mittel: 1, voll: 2 };
+const GUTSCHEIN_MAX_GRENZE = 100000;
+const GUTSCHEIN_MAX_ANZAHL = 1000;
+const GUTSCHEIN_MAX_JAHRE = 5;
+
+/* Zeigt ein 8-stelliger Code in zwei Vierergruppen (ABCD-EFGH), andere Codes unverändert. */
+function codeAnzeige(code) { const c = String(code || ''); return /^[A-Z0-9]{8}$/.test(c) ? c.slice(0, 4) + '-' + c.slice(4) : c; }
+/* Eingabe: Groß, ohne Leerzeichen und Striche. Leer, wenn ungültig. */
+function gutscheinCode(roh) {
+  const t = typeof roh === 'string' ? roh.toUpperCase().replace(/[\s-]+/g, '') : '';
+  return /^[A-Z0-9]{4,24}$/.test(t) ? t : '';
+}
+function plusMonateMs(ms, n) {
+  const d = new Date(ms), tag = d.getUTCDate();
+  d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() + n);
+  const max = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(tag, max));
+  return d.getTime();
+}
+
+/* Fehlen die Tabellen oder Spalten aus 13f-8.sql, sagt der Dienst es klar. Ohne Code läuft das Bezahlen wie bisher. */
+async function gutscheinSchutz(f) {
+  try { return await f(); } catch (e) {
+    if (e instanceof HttpFehler) throw e;
+    if (/no such (table|column)/i.test(String(e && e.message || e))) throw new HttpFehler(503, 'Gutscheincodes gehen noch nicht: Im Dienst fehlen die SQL-Zeilen aus 13f-8.sql. Bitte beim Betreiber melden.');
+    throw e;
+  }
+}
+
+/* Wie viele Versuche pro Stunde: je Konto 20 und je Adresse 60 (Schutz gegen Durchprobieren). */
+async function gutscheinBremse(request, db, a, jetzt) {
+  await bremsen(db, await schluesselFuer('gs-k', a.id), 20, 60 * MINUTE, jetzt, 'Es wurden zu viele Codes ausprobiert.');
+  await bremsen(db, await schluesselFuer('gs-i', request.headers.get('CF-Connecting-IP') || 'unbekannt'), 60, 60 * MINUTE, jetzt, 'Von hier wurden zu viele Codes ausprobiert.');
+}
+
+/* Lädt den Code und prüft, ob er für dieses Konto noch zu haben ist. */
+async function gutscheinLaden(db, a, roh, jetzt) {
+  const code = gutscheinCode(roh);
+  if (!code) throw new HttpFehler(400, 'Bitte einen Code eintragen (Buchstaben und Ziffern).', { feld: 'code' });
+  const g = await db.prepare('SELECT code, prozent, stufe, monate, grenze, eingeloest, laeuft_ab FROM gutschein WHERE code = ?').bind(code).first();
+  if (!g) throw new HttpFehler(400, 'Diesen Code gibt es nicht.', { feld: 'code' });
+  if (g.laeuft_ab <= jetzt) throw new HttpFehler(400, 'Dieser Code ist abgelaufen.', { feld: 'code' });
+  if (g.eingeloest >= g.grenze) throw new HttpFehler(400, 'Dieser Code ist schon aufgebraucht.', { feld: 'code' });
+  const schon = await db.prepare('SELECT 1 AS x FROM gutschein_einloesung WHERE code = ? AND nutzer_id = ?').bind(code, a.id).first();
+  if (schon) throw new HttpFehler(400, 'Du hast diesen Code schon eingelöst.', { feld: 'code' });
+  return g;
+}
+
+/* Neukunde: das Konto hat nie bezahlt (kein Beleg zur E-Mail-Adresse, auch nach einer Kontolöschung) und nie Mittel oder Voll gehabt. */
+async function istNeukunde(db, a) {
+  const b = await db.prepare('SELECT 1 AS x FROM beleg WHERE lower(email) = ? LIMIT 1').bind(String(a.email || '').toLowerCase()).first();
+  if (b) return false;
+  const s = await db.prepare("SELECT 1 AS x FROM stufe_konto WHERE nutzer_id = ? AND stufe IN ('mittel', 'voll', 'entwickler')").bind(a.id).first();
+  return !s;
+}
+
+/* Rabattcode (1 bis 25 %) für ein Angebot: rechnet den Preis. Wirft, wenn der Code hier nicht gilt. */
+async function gutscheinRabatt(db, a, g, produktId) {
+  const p = PRODUKTE[produktId];
+  if (p.art !== 'stufe') throw new HttpFehler(400, 'Der Rabattcode gilt nicht für zusätzliche Recherchen, nur für den ersten Kauf von Mittel oder Voll.', { feld: 'code' });
+  if (!(await istNeukunde(db, a))) throw new HttpFehler(400, 'Dieser Rabattcode gilt nur für Neukunden beim ersten Kauf. Beim Verlängern, beim Wechsel von Mittel auf Voll und bei Recherchen gibt es keinen Rabatt.', { feld: 'code' });
+  const rabattCent = Math.round(p.cent * g.prozent / 100);
+  return { code: g.code, prozent: g.prozent, listeCent: p.cent, rabattCent, zahlCent: p.cent - rabattCent };
+}
+function gutscheinAntwort(gs) {
+  return { code: codeAnzeige(gs.code), prozent: gs.prozent, preis: centText(gs.listeCent), rabatt: '−' + centText(gs.rabattCent), betrag: centText(gs.zahlCent), cent: gs.zahlCent };
+}
+
+/* Beim Bezahlen: gibt die Rechnung des Rabatts zurück. Ein 100-%-Code gehört nicht hierher, er schaltet direkt frei. */
+async function gutscheinFuerKauf(db, a, produktId, roh, jetzt) {
+  return gutscheinSchutz(async () => {
+    const g = await gutscheinLaden(db, a, roh, jetzt);
+    if (g.prozent === 100) throw new HttpFehler(400, 'Dieser Code schaltet ohne Bezahlen frei. Bitte „Code einlösen“ wählen.', { feld: 'code' });
+    return gutscheinRabatt(db, a, g, produktId);
+  });
+}
+
+/* Was würde ein 100-%-Code tun? Gibt Stufe und neues Ende zurück oder wirft. Ändert nichts. */
+async function gutscheinFreiPlan(db, a, g, jetzt) {
+  const st = await stufeVon(db, a.id, jetzt, false);
+  if (st.id === 'entwickler') throw new HttpFehler(400, 'Dieses Konto hat die Stufe Entwickler und braucht keinen Code.', { feld: 'code' });
+  const rc = GUTSCHEIN_RANG[g.stufe];
+  if (!rc || !(g.monate >= 1 && g.monate <= 12)) throw new HttpFehler(400, 'Dieser Code ist nicht in Ordnung. Bitte beim Betreiber melden.', { feld: 'code' });
+  const rs = GUTSCHEIN_RANG[st.id] || 0;
+  if (rs > rc) throw new HttpFehler(400, 'Du hast bereits ' + st.name + (st.bis ? ' (bis ' + datumDe(st.bis) + ')' : '') + '. Dieser Code gibt nur ' + STUFEN[g.stufe].name + ' und wäre nicht nützlich.', { feld: 'code' });
+  let start = jetzt;
+  if (rs === rc) {
+    if (st.bis === null || st.bis === undefined) throw new HttpFehler(400, 'Deine Stufe ' + st.name + ' hat kein Ablaufdatum, der Code wird nicht gebraucht.', { feld: 'code' });
+    start = st.bis;
+  }
+  return { stufe: g.stufe, name: STUFEN[g.stufe].name, monate: g.monate, bis: plusMonateMs(start, g.monate), verlaengert: rs === rc, ersetzt: rs > 0 && rs < rc ? st.name : null };
+}
+
+/* App: Code prüfen, bevor bezahlt wird. Rabattcode: Preise der beiden Stufen. 100-%-Code: Stufe, Laufzeit und neues Ende. */
+async function gutscheinPruefen(request, env, db, jetzt) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request, MAX_BODY);
+  await gutscheinBremse(request, db, a, jetzt);
+  return gutscheinSchutz(async () => {
+    const g = await gutscheinLaden(db, a, b.code, jetzt);
+    if (g.prozent === 100) {
+      const plan = await gutscheinFreiPlan(db, a, g, jetzt);
+      return { ok: true, art: 'frei', code: codeAnzeige(g.code), stufe: plan.stufe, stufeName: plan.name, monate: plan.monate, bis: datumDe(plan.bis), verlaengert: plan.verlaengert, ersetzt: plan.ersetzt };
+    }
+    const preise = {};
+    for (const id of ['mittel', 'voll']) {
+      const bp = await bestellPruefen(db, a.id, id, jetzt).then(() => true, () => false);
+      /* Auch ein Angebot, das gerade nicht kaufbar ist (Mittel bei laufendem Voll), bekommt keinen Preis. */
+      if (!bp) continue;
+      preise[id] = gutscheinAntwort(await gutscheinRabatt(db, a, g, id));
+    }
+    return { ok: true, art: 'rabatt', code: codeAnzeige(g.code), prozent: g.prozent, preise };
+  });
+}
+
+/* 100-%-Code einlösen: Stufe ohne Zahlung setzen. */
+async function gutscheinEinloesen(request, env, db, jetzt) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request, MAX_BODY);
+  await gutscheinBremse(request, db, a, jetzt);
+  return gutscheinSchutz(async () => {
+    const g = await gutscheinLaden(db, a, b.code, jetzt);
+    if (g.prozent !== 100) throw new HttpFehler(400, 'Das ist ein Rabattcode. Gib ihn beim Bezahlen ein, er schaltet nicht allein frei.', { feld: 'code' });
+    const plan = await gutscheinFreiPlan(db, a, g, jetzt);
+    /* Erst die Einlösung sichern (nur wenn noch frei und nicht abgelaufen), dann Stufe setzen. */
+    const r = await db.prepare('UPDATE gutschein SET eingeloest = eingeloest + 1 WHERE code = ? AND eingeloest < grenze AND laeuft_ab > ?').bind(g.code, jetzt).run();
+    if (!(r && r.meta && r.meta.changes === 1)) throw new HttpFehler(400, 'Dieser Code ist schon aufgebraucht.', { feld: 'code' });
+    try {
+      await db.batch([
+        db.prepare('INSERT OR REPLACE INTO stufe_konto (nutzer_id, stufe, gueltig_bis, geaendert_am) VALUES (?, ?, ?, ?)').bind(a.id, plan.stufe, plan.bis, jetzt),
+        db.prepare('INSERT INTO gutschein_einloesung (code, nutzer_id, am, art, referenz) VALUES (?, ?, ?, ?, ?)').bind(g.code, a.id, jetzt, 'frei', plan.stufe + ':' + plan.monate)
+      ]);
+    } catch (e) {
+      try { await db.prepare('UPDATE gutschein SET eingeloest = eingeloest - 1 WHERE code = ? AND eingeloest > 0').bind(g.code).run(); } catch (e2) { /* Support */ }
+      throw e;
+    }
+    const text = 'Hallo,\n\ndein Code ' + codeAnzeige(g.code) + ' ist eingelöst. Dein MobiMory ' + plan.name + ' gilt jetzt bis ' + datumDe(plan.bis) + '.\n\n'
+      + (plan.ersetzt ? 'Die restliche Zeit deiner Stufe ' + plan.ersetzt + ' wird nicht angerechnet, ' + plan.name + ' gilt ab sofort.\n\n' : '')
+      + 'Es ist kein Abo: Es wird nichts abgebucht. Vor dem Ablauf bekommst du eine Erinnerung. Es wurde nichts bezahlt, deshalb gibt es keinen Beleg.';
+    try { await mailSenden(env, a.email, 'MobiMory: Dein Code ist eingelöst', text); } catch (e) { /* die Mail ist nur eine Hilfe */ }
+    return { ok: true, art: 'frei', stufe: plan.stufe, stufeName: plan.name, bis: plan.bis, bisText: datumDe(plan.bis) };
+  });
+}
+
+/* ---- nur Admins: anlegen, auflisten, löschen ---- */
+
+async function gutscheinAnlegen(request, env, db, jetzt) {
+  const a = await nurAdmin(request, db, jetzt);
+  const b = await bodyLesen(request, MAX_BODY);
+  const proz = Number(String(b.prozent === undefined || b.prozent === null ? '' : b.prozent).trim().replace(',', '.'));
+  const prozent = Math.round(proz * 100) / 100;
+  if (!Number.isFinite(proz) || String(b.prozent).trim() === '' || !((prozent > 0 && prozent <= GUTSCHEIN_MAX_PROZENT) || prozent === 100)) {
+    throw new HttpFehler(400, 'Der Rabatt muss mehr als 0 und höchstens ' + GUTSCHEIN_MAX_PROZENT + ' % sein, oder genau 100 %. Dazwischen geht nicht.', { feld: 'prozent' });
+  }
+  const frei = prozent === 100;
+  let stufe = null, monate = null, grenze = 1;
+  if (frei) {
+    if (!Object.prototype.hasOwnProperty.call(GUTSCHEIN_RANG, b.stufe)) throw new HttpFehler(400, 'Bei 100 % muss die Stufe Mittel oder Voll gewählt sein.', { feld: 'stufe' });
+    stufe = b.stufe;
+    monate = Number(b.monate);
+    if (!Number.isInteger(monate) || monate < 1 || monate > 12) throw new HttpFehler(400, 'Die Laufzeit muss 1 bis 12 Monate sein.', { feld: 'monate' });
+  } else {
+    grenze = b.grenze === undefined || b.grenze === null || String(b.grenze).trim() === '' ? 1 : Number(b.grenze);
+    if (!Number.isInteger(grenze) || grenze < 1 || grenze > GUTSCHEIN_MAX_GRENZE) throw new HttpFehler(400, 'Die Obergrenze der Einlösungen muss eine ganze Zahl von 1 bis ' + GUTSCHEIN_MAX_GRENZE + ' sein.', { feld: 'grenze' });
+  }
+  const tag = datumTeile(b.laeuftAb);
+  if (!tag) throw new HttpFehler(400, 'Das Ablaufdatum fehlt oder ist ungültig (Jahr-Monat-Tag).', { feld: 'laeuftAb' });
+  const ablauf = tagEnde(b.laeuftAb);
+  if (ablauf <= jetzt) throw new HttpFehler(400, 'Das Ablaufdatum muss in der Zukunft liegen.', { feld: 'laeuftAb' });
+  if (ablauf > jetzt + GUTSCHEIN_MAX_JAHRE * 366 * TAG) throw new HttpFehler(400, 'Das Ablaufdatum darf höchstens ' + GUTSCHEIN_MAX_JAHRE + ' Jahre entfernt sein.', { feld: 'laeuftAb' });
+  const notiz = typeof b.notiz === 'string' ? b.notiz.trim().slice(0, 80) : '';
+  /* Ein 100-%-Code ist Geld wert: Er wird immer zufällig erzeugt, nie frei gewählt. */
+  const eigener = !frei && typeof b.code === 'string' && b.code.trim() ? gutscheinCode(b.code) : '';
+  if (!frei && typeof b.code === 'string' && b.code.trim() && !eigener) throw new HttpFehler(400, 'Der Code darf nur Buchstaben und Ziffern enthalten (4 bis 24 Zeichen).', { feld: 'code' });
+  return gutscheinSchutz(async () => {
+    const n = await db.prepare('SELECT COUNT(*) AS n FROM gutschein').first();
+    if (n && n.n >= GUTSCHEIN_MAX_ANZAHL) throw new HttpFehler(400, 'Es sind höchstens ' + GUTSCHEIN_MAX_ANZAHL + ' Codes möglich. Bitte alte löschen.');
+    let code = eigener;
+    if (eigener) {
+      const da = await db.prepare('SELECT 1 AS x FROM gutschein WHERE code = ?').bind(eigener).first();
+      if (da) throw new HttpFehler(400, 'Diesen Code gibt es schon.', { feld: 'code' });
+    } else {
+      for (let i = 0; i < 5 && !code; i++) {
+        const c = zufallCode(8);
+        const da = await db.prepare('SELECT 1 AS x FROM gutschein WHERE code = ?').bind(c).first();
+        if (!da) code = c;
+      }
+      if (!code) throw new HttpFehler(500, 'Es konnte kein freier Code erzeugt werden. Bitte noch einmal versuchen.');
+    }
+    await db.prepare('INSERT INTO gutschein (code, prozent, stufe, monate, grenze, eingeloest, laeuft_ab, erstellt_am, erstellt_von, notiz) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)')
+      .bind(code, prozent, stufe, monate, grenze, ablauf, jetzt, a.email, notiz || null).run();
+    return { ok: true, code: codeAnzeige(code) };
+  });
+}
+
+async function gutscheinListe(request, env, db, jetzt) {
+  await nurAdmin(request, db, jetzt);
+  return gutscheinSchutz(async () => {
+    const r = await db.prepare('SELECT code, prozent, stufe, monate, grenze, eingeloest, laeuft_ab, erstellt_am, notiz FROM gutschein ORDER BY erstellt_am DESC, code LIMIT 300').all();
+    return { ok: true, codes: (r.results || []).map((x) => ({ code: codeAnzeige(x.code), prozent: x.prozent, stufe: x.stufe || null, monate: x.monate === undefined ? null : x.monate, grenze: x.grenze, eingeloest: x.eingeloest,
+      laeuftAb: datumText(x.laeuft_ab), abgelaufen: x.laeuft_ab <= jetzt, aufgebraucht: x.eingeloest >= x.grenze, notiz: x.notiz || '' })) };
+  });
+}
+
+async function gutscheinLoeschen(request, env, db, jetzt) {
+  await nurAdmin(request, db, jetzt);
+  const b = await bodyLesen(request, MAX_BODY);
+  const code = gutscheinCode(b.code);
+  if (!code) throw new HttpFehler(400, 'Der Code fehlt.', { feld: 'code' });
+  return gutscheinSchutz(async () => {
+    await db.prepare('DELETE FROM gutschein WHERE code = ?').bind(code).run();
+    return { ok: true };
+  });
 }
 
 /* ---------- die Wege ---------- */
@@ -1891,9 +2151,13 @@ async function bezahlenStarten(request, env, db, jetzt, optionen) {
   const { id, p } = produktVon(b.produkt);
   const weg = b.weg === 'ueberweisung' ? 'ueberweisung' : (b.weg === 'paypal' ? 'paypal' : '');
   if (!weg) throw new HttpFehler(400, 'Der Zahlungsweg fehlt oder ist unbekannt.', { feld: 'weg' });
+  /* Gutscheincode (13f-8): nur ein Rabattcode (1 bis 25 %) gilt beim Bezahlen. Ohne Code läuft alles wie bisher. */
+  const codeRoh = typeof b.code === 'string' ? b.code.trim() : '';
+  const gs = codeRoh ? await gutscheinFuerKauf(db, a, id, codeRoh, jetzt) : null;
+  const preis = gs ? gs.zahlCent : p.cent;
   if (weg === 'paypal') {
-    const r = await paypalBestellen(env, db, { id: a.id, email: a.email }, id, jetzt, optionen);
-    return { ok: true, weg, produkt: id, betrag: centText(p.cent), url: r.url };
+    const r = await paypalBestellen(env, db, { id: a.id, email: a.email }, id, jetzt, optionen, gs);
+    return Object.assign({ ok: true, weg, produkt: id, betrag: centText(preis), url: r.url }, gs ? { rabatt: gutscheinAntwort(gs) } : {});
   }
   const bank = ueberweisungDaten(env);
   if (!bank) throw new HttpFehler(503, 'Die Überweisung ist im Dienst noch nicht eingerichtet.');
@@ -1901,13 +2165,13 @@ async function bezahlenStarten(request, env, db, jetzt, optionen) {
   await bremsen(db, await schluesselFuer('bez', a.id), 10, 60 * MINUTE, jetzt, 'Es wurden zu viele Bestellungen hintereinander angelegt.');
   const offen = await db.prepare("SELECT COUNT(*) AS n FROM bestellung WHERE nutzer_id = ? AND weg = 'ueberweisung'").bind(a.id).first();
   if (offen && offen.n >= MAX_OFFENE_UEBERWEISUNGEN) throw new HttpFehler(400, 'Es warten schon ' + MAX_OFFENE_UEBERWEISUNGEN + ' Überweisungen auf Geldeingang. Bitte warte, bis sie verbucht sind.');
-  const ref = await bestellungAnlegen(db, { id: a.id, email: a.email }, id, 'ueberweisung', jetzt);
-  const text = 'Du hast ' + p.name + ' für ' + centText(p.cent) + ' bestellt. Bitte überweise den Betrag:\n\n'
-    + 'Empfänger: ' + bank.inhaber + '\nIBAN: ' + bank.iban + (bank.bic ? '\nBIC: ' + bank.bic : '') + '\nBetrag: ' + centText(p.cent) + '\nVerwendungszweck: ' + ref
+  const ref = await bestellungAnlegen(db, { id: a.id, email: a.email }, id, 'ueberweisung', jetzt, gs);
+  const text = 'Du hast ' + p.name + ' für ' + centText(preis) + ' bestellt' + (gs ? ' (Preis ' + centText(p.cent) + ', Rabatt mit Code ' + codeAnzeige(gs.code) + ': −' + centText(gs.rabattCent) + ')' : '') + '. Bitte überweise den Betrag:\n\n'
+    + 'Empfänger: ' + bank.inhaber + '\nIBAN: ' + bank.iban + (bank.bic ? '\nBIC: ' + bank.bic : '') + '\nBetrag: ' + centText(preis) + '\nVerwendungszweck: ' + ref
     + '\n\nBitte genau diesen Verwendungszweck angeben, damit die Zahlung zugeordnet wird. Nach Geldeingang wird dein Konto freigeschaltet, du bekommst dann eine Mail mit dem Beleg. Es ist kein Abo, es wird nichts abgebucht.';
   let mail = false;
   try { await mailSenden(env, a.email, 'Deine Überweisung an MobiMory (' + ref + ')', text); mail = true; } catch (e) { mail = false; }
-  return { ok: true, weg, produkt: id, betrag: centText(p.cent), referenz: ref, empfaenger: bank.inhaber, iban: bank.iban, bic: bank.bic, verwendungszweck: ref, mail };
+  return Object.assign({ ok: true, weg, produkt: id, betrag: centText(preis), referenz: ref, empfaenger: bank.inhaber, iban: bank.iban, bic: bank.bic, verwendungszweck: ref, mail }, gs ? { rabatt: gutscheinAntwort(gs) } : {});
 }
 
 /* PayPal schickt den Kunden nach dem Bezahlen hierher zurück: Die Zahlung wird abgeschlossen (capture) und die Stufe gesetzt. */
@@ -1915,7 +2179,7 @@ async function paypalZurueck(request, env, db, jetzt, optionen) {
   const bid = (new URL(request.url).searchParams.get('b') || '').toUpperCase();
   const app = appUrl(env) ? { url: appUrl(env), text: 'Zurück zur App' } : null;
   if (!/^MM-[A-Z0-9]{8}$/.test(bid)) return kleineSeite('Unbekannte Bestellung', 'Diese Adresse gehört zu keiner Bestellung.', 404, app);
-  const best = await db.prepare("SELECT id, nutzer_id, email, produkt, cent, paypal_id FROM bestellung WHERE id = ? AND weg = 'paypal'").bind(bid).first();
+  const best = await db.prepare("SELECT * FROM bestellung WHERE id = ? AND weg = 'paypal'").bind(bid).first();
   if (!best || !best.paypal_id) return kleineSeite('Schon verbucht', 'Diese Zahlung ist schon verbucht oder die Bestellung gibt es nicht mehr. Öffne die App: Unter Konto siehst du deine Stufe.', 200, app);
   const holen = (optionen && optionen.fetch) || fetch;
   const token = await paypalToken(env, holen);
@@ -2054,15 +2318,15 @@ async function adminPruefen(request, env, db, jetzt) {
 
 async function freischaltListe(request, env, db, jetzt) {
   await adminPruefen(request, env, db, jetzt);
-  const z = await db.prepare("SELECT id, email, produkt, cent, erstellt_am FROM bestellung WHERE weg = 'ueberweisung' ORDER BY erstellt_am LIMIT 200").all();
-  return { ok: true, bestellungen: (z.results || []).map((r) => ({ id: r.id, email: r.email, angebot: PRODUKTE[r.produkt] ? PRODUKTE[r.produkt].kurz : r.produkt, betrag: centText(r.cent), datum: datumDe(r.erstellt_am) })) };
+  const z = await db.prepare("SELECT * FROM bestellung WHERE weg = 'ueberweisung' ORDER BY erstellt_am LIMIT 200").all();
+  return { ok: true, bestellungen: (z.results || []).map((r) => ({ id: r.id, email: r.email, angebot: (PRODUKTE[r.produkt] ? PRODUKTE[r.produkt].kurz : r.produkt) + (r.gutschein ? ' mit Code ' + codeAnzeige(r.gutschein) : ''), betrag: centText(r.cent), datum: datumDe(r.erstellt_am) })) };
 }
 
 async function freischaltBestaetigen(request, env, db, jetzt) {
   await adminPruefen(request, env, db, jetzt);
   const b = await bodyLesen(request, MAX_BODY);
   const ref = typeof b.referenz === 'string' ? b.referenz.toUpperCase().trim() : '';
-  const best = /^MM-[A-Z0-9]{8}$/.test(ref) ? await db.prepare("SELECT id, nutzer_id, email, produkt, cent FROM bestellung WHERE id = ? AND weg = 'ueberweisung'").bind(ref).first() : null;
+  const best = /^MM-[A-Z0-9]{8}$/.test(ref) ? await db.prepare("SELECT * FROM bestellung WHERE id = ? AND weg = 'ueberweisung'").bind(ref).first() : null;
   if (!best) throw new HttpFehler(404, 'Diese Bestellung gibt es nicht (mehr).');
   const erg = await bestellungAbschliessen(env, db, best, 'ueberweisung', best.id, jetzt);
   return { ok: true, nummer: erg.nummer, bis: erg.bis };
