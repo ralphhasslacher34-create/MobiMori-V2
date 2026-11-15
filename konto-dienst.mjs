@@ -53,6 +53,8 @@
  * 13f-10 (seit 2.0.88, Routenplanung): POST /route/planen. Der Dienst prüft Anmeldung und Stufe, zählt die Route (eigene Zahl, getrennt von den Online-Checks: Testwoche 10, Mittel 100, Voll 1000 im Jahr,
  *      Nachkauf 100 Routen für 9,99 €), ruft HERE Routing v8 (Truck) mit den Maßen und Gewichten des Fahrzeugs auf und gibt Punkte, Länge, Dauer und Warnungen zurück. Der HERE-Schlüssel
  *      (Secret HERE_SCHLUESSEL) bleibt im Dienst. Schlägt HERE fehl oder findet keine Route, wird nicht gezählt. Zwei neue Tabellen (13f-10.sql: route_nutzung, route_extra).
+ * 13f-11 (seit 2.0.94, Verwaltung): GET /verwaltung/statistik (Konten insgesamt, davon Test, Mittel, Voll; Admin und Entwickler) und Zahlungseingänge buchen und freischalten in der App
+ *      (/verwaltung/bestellungen, /bestaetigen, /direkt, /loeschen; nur Admins, mit der Anmeldung der App). Die Seite /freischalten mit Passwort bleibt. Keine neue SQL-Zeile.
  * 13e-5 (seit 2.0.73): Rollen-Tabelle „rolle“ (E-Mail, Name, Funktion Admin oder Entwickler). Die App erkennt daran den Bereich „Nur für Entwickler“;
  *      die Tabelle ändern nur Admins (GET /rolle/liste, POST /rolle/setzen, POST /rolle/entfernen). Eine SQL-Zeile (13e-5.sql), dazu der erste Admin von Hand.
  * 13e-4 (seit 2.0.72): Bezahlung. Zwei Wege: PayPal (der Dienst legt die Bestellung bei PayPal an, nach dem Bezahlen schließt er sie ab und schaltet sofort frei)
@@ -62,7 +64,7 @@
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13f-10';
+export const VERSION = '13f-11';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -1907,7 +1909,12 @@ export async function behandeln(request, env, optionen) {
       'POST /freischalten/liste': freischaltListe,
       'POST /freischalten/bestaetigen': freischaltBestaetigen,
       'POST /freischalten/direkt': freischaltDirekt,
-      'POST /freischalten/loeschen': freischaltLoeschen
+      'POST /freischalten/loeschen': freischaltLoeschen,
+      'GET /verwaltung/statistik': verwaltungStatistik,
+      'GET /verwaltung/bestellungen': verwaltungBestellungen,
+      'POST /verwaltung/bestaetigen': verwaltungBestaetigen,
+      'POST /verwaltung/direkt': verwaltungDirekt,
+      'POST /verwaltung/loeschen': verwaltungLoeschen
     };
     const f = wege[weg];
     if (!f) return antwort(404, { ok: false, error: 'Diese Adresse gibt es beim Dienst nicht.' }, cors);
@@ -2546,14 +2553,14 @@ async function adminPruefen(request, env, db, jetzt) {
   }
 }
 
-async function freischaltListe(request, env, db, jetzt) {
-  await adminPruefen(request, env, db, jetzt);
+/* Die vier Arbeiten der Freischaltung. Sie prüfen die Berechtigung nicht selbst: Die Freischalt-Seite (Passwort) und die Verwaltung in der App (Rolle Admin, seit 13f-11)
+   rufen sie nach ihrer eigenen Prüfung auf. */
+async function freischaltListeKern(db) {
   const z = await db.prepare("SELECT * FROM bestellung WHERE weg = 'ueberweisung' ORDER BY erstellt_am LIMIT 200").all();
   return { ok: true, bestellungen: (z.results || []).map((r) => ({ id: r.id, email: r.email, angebot: (PRODUKTE[r.produkt] ? PRODUKTE[r.produkt].kurz : r.produkt) + (r.gutschein ? ' mit Code ' + codeAnzeige(r.gutschein) : ''), betrag: centText(r.cent), datum: datumDe(r.erstellt_am) })) };
 }
 
-async function freischaltBestaetigen(request, env, db, jetzt) {
-  await adminPruefen(request, env, db, jetzt);
+async function freischaltBestaetigenKern(request, env, db, jetzt) {
   const b = await bodyLesen(request, MAX_BODY);
   const ref = typeof b.referenz === 'string' ? b.referenz.toUpperCase().trim() : '';
   const best = /^MM-[A-Z0-9]{8}$/.test(ref) ? await db.prepare("SELECT * FROM bestellung WHERE id = ? AND weg = 'ueberweisung'").bind(ref).first() : null;
@@ -2562,8 +2569,7 @@ async function freischaltBestaetigen(request, env, db, jetzt) {
   return { ok: true, nummer: erg.nummer, bis: erg.bis };
 }
 
-async function freischaltDirekt(request, env, db, jetzt) {
-  await adminPruefen(request, env, db, jetzt);
+async function freischaltDirektKern(request, env, db, jetzt) {
   const b = await bodyLesen(request, MAX_BODY);
   const email = emailNormal(b.email);
   const { id, p } = produktVon(b.produkt);
@@ -2575,14 +2581,52 @@ async function freischaltDirekt(request, env, db, jetzt) {
   return { ok: true, nummer: erg.nummer, bis: erg.bis };
 }
 
-async function freischaltLoeschen(request, env, db, jetzt) {
-  await adminPruefen(request, env, db, jetzt);
+async function freischaltLoeschenKern(request, db) {
   const b = await bodyLesen(request, MAX_BODY);
   const ref = typeof b.referenz === 'string' ? b.referenz.toUpperCase().trim() : '';
   if (!/^MM-[A-Z0-9]{8}$/.test(ref)) throw new HttpFehler(400, 'Die Bestellnummer ist ungültig.');
   await db.prepare("DELETE FROM bestellung WHERE id = ? AND weg = 'ueberweisung'").bind(ref).run();
   return { ok: true };
 }
+
+/* Die Freischalt-Seite im Browser (Passwort FREISCHALT_TOKEN), unverändert. */
+async function freischaltListe(request, env, db, jetzt) { await adminPruefen(request, env, db, jetzt); return freischaltListeKern(db); }
+async function freischaltBestaetigen(request, env, db, jetzt) { await adminPruefen(request, env, db, jetzt); return freischaltBestaetigenKern(request, env, db, jetzt); }
+async function freischaltDirekt(request, env, db, jetzt) { await adminPruefen(request, env, db, jetzt); return freischaltDirektKern(request, env, db, jetzt); }
+async function freischaltLoeschen(request, env, db, jetzt) { await adminPruefen(request, env, db, jetzt); return freischaltLoeschenKern(request, db); }
+
+/* ---------- 13f-11: Verwaltung in der App (seit 2.0.94) ---------- */
+
+/* Festlegung des Nutzers (15.11.2026): Die Kachel „Verwaltung“ im Bereich „Nur für Entwickler“ zeigt die Statistik (Konten insgesamt, davon Test, Mittel, Voll) und
+   bucht Zahlungseingänge von Überweisungen (Freischaltung). Die Statistik sehen Admin und Entwickler, Buchen und Freischalten dürfen nur Admins (wie bei den Gutscheincodes).
+   Angemeldet wird wie sonst mit der Anmeldung der App, ein zweites Passwort gibt es dafür nicht. Die Seite /freischalten mit Passwort bleibt daneben bestehen. */
+async function verwaltungPruefen(request, db, jetzt, nurAdminErlaubt) {
+  const a = await authentifizieren(request, db, jetzt);
+  const r = await rolleVon(db, a.email);
+  if (!r || (nurAdminErlaubt && r !== 'admin')) throw new HttpFehler(403, nurAdminErlaubt ? 'Zahlungseingänge buchen und freischalten dürfen nur Administratoren.' : 'Die Verwaltung sehen nur Administratoren und Entwickler.');
+  return a;
+}
+
+/* Gezählt werden bestätigte Konten nach der Stufe, die sie heute haben (dieselbe Regel wie stufeVon: bezahlt und gültig, sonst laufende Testwoche, sonst Basic). */
+async function verwaltungStatistik(request, env, db, jetzt) {
+  await verwaltungPruefen(request, db, jetzt, false);
+  let z, abg;
+  try {
+    z = await db.prepare("SELECT CASE WHEN s.stufe IN ('mittel', 'voll', 'entwickler') AND (s.gueltig_bis IS NULL OR s.gueltig_bis > ?) THEN s.stufe "
+      + "WHEN EXISTS (SELECT 1 FROM testwoche t WHERE t.nutzer_id = n.id AND t.ende_am > ?) THEN 'test' ELSE 'basic' END AS st, COUNT(*) AS n "
+      + 'FROM nutzer n LEFT JOIN stufe_konto s ON s.nutzer_id = n.id WHERE n.bestaetigt_am IS NOT NULL GROUP BY st').bind(jetzt, jetzt).all();
+    abg = await db.prepare("SELECT COUNT(*) AS n FROM stufe_konto s JOIN nutzer n ON n.id = s.nutzer_id WHERE n.bestaetigt_am IS NOT NULL AND s.stufe IN ('mittel', 'voll') AND s.gueltig_bis IS NOT NULL AND s.gueltig_bis <= ?").bind(jetzt).first();
+  } catch (e) { if (fehltTabelle(e)) throw new HttpFehler(503, 'Die Tabellen für die Stufen fehlen noch (Update auf 13e, siehe server/EINRICHTUNG.md).'); throw e; }
+  const nach = { test: 0, basic: 0, mittel: 0, voll: 0, entwickler: 0 };
+  (z.results || []).forEach((r) => { if (r.st in nach) nach[r.st] = r.n; });
+  const konten = nach.test + nach.basic + nach.mittel + nach.voll + nach.entwickler;
+  return { ok: true, stand: datumDe(jetzt), konten, test: nach.test, mittel: nach.mittel, voll: nach.voll, entwickler: nach.entwickler, basic: nach.basic, abgelaufen: abg ? abg.n : 0 };
+}
+
+async function verwaltungBestellungen(request, env, db, jetzt) { await verwaltungPruefen(request, db, jetzt, true); return freischaltListeKern(db); }
+async function verwaltungBestaetigen(request, env, db, jetzt) { await verwaltungPruefen(request, db, jetzt, true); return freischaltBestaetigenKern(request, env, db, jetzt); }
+async function verwaltungDirekt(request, env, db, jetzt) { await verwaltungPruefen(request, db, jetzt, true); return freischaltDirektKern(request, env, db, jetzt); }
+async function verwaltungLoeschen(request, env, db, jetzt) { await verwaltungPruefen(request, db, jetzt, true); return freischaltLoeschenKern(request, db); }
 
 /* ---------- 13e-3: Kosten-Wächter für die Testwochen (seit 2.0.71) ---------- */
 
