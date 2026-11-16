@@ -28,6 +28,8 @@
  * 13c: Freigaben je Fahrzeug und Zeitraum (nur lesen, höchstens 12 Monate, Einladung per Code an die E-Mail-Adresse des Gastes) und die Kontroll-Freigabe
  *      per Code (ohne Konto, nur Papiere und Prüfergebnis, höchstens 7 Tage). Die Rechte werden bei jeder Anfrage auf dem Server geprüft. Zwei weitere
  *      Tabellen „freigabe“ und „kontrolle“ (schema.sql, ab „13c“).
+ * 13g: Lesedienst für Smart Capture (Google Cloud Vision, EU-Adresse): Foto rein, Text mit Positionen raus, nichts gespeichert, nur gezählt (Tabelle lese_nutzung).
+ *      Secret GOOGLE_VISION_KEY im Worker.
  * 13e: Stufen (Basic, Testwoche, Mittel, Voll, Entwickler ohne Grenzen) mit Grenzen für Geräte und Online-Checks. Die Online-Checks gehen über diesen Dienst: Er prüft Anmeldung,
  *      Stufe und Kontingent, zählt, reicht die Anfrage an den Recherche-Dienst weiter und speichert das Ergebnis (Check-Datenbank). Eine Testwoche je
  *      bestätigter E-Mail-Adresse. Vier weitere Tabellen (schema.sql, ab „13e“). Nötig dafür: Variable RECHERCHE_URL und Geheimnis RECHERCHE_TOKEN.
@@ -64,7 +66,7 @@
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13f-11';
+export const VERSION = '13g';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -247,6 +249,7 @@ async function aufraeumen(db, jetzt) {
   ]);
   await freigabenAufraeumen(db, jetzt);
   await checksAufraeumen(db, jetzt);
+  await lesenAufraeumen(db, jetzt);
   await bestellungenAufraeumen(db, jetzt);
 }
 
@@ -1376,6 +1379,8 @@ async function gesundheit(env) {
   try { const db = datenbank(env); for (const t of ['bestellung', 'beleg', 'check_extra', 'erinnerung', 'zaehler']) await db.prepare('SELECT 1 FROM ' + t + ' LIMIT 1').first(); bezTabellen = true; } catch (e) { bezTabellen = false; }
   let routenTab = false;
   try { const db = datenbank(env); await db.prepare('SELECT 1 FROM route_nutzung LIMIT 1').first(); await db.prepare('SELECT 1 FROM route_extra LIMIT 1').first(); routenTab = true; } catch (e) { routenTab = false; }
+  let lesenTab = false;
+  try { await datenbank(env).prepare('SELECT 1 FROM lese_nutzung LIMIT 1').first(); lesenTab = true; } catch (e) { lesenTab = false; }
   let gutscheine = false;
   try { const db = datenbank(env); await db.prepare('SELECT 1 FROM gutschein LIMIT 1').first(); await db.prepare('SELECT 1 FROM gutschein_einloesung LIMIT 1').first(); await db.prepare('SELECT gutschein, liste_cent FROM bestellung LIMIT 1').first(); await db.prepare('SELECT gutschein, liste_cent FROM beleg LIMIT 1').first(); gutscheine = true; } catch (e) { gutscheine = false; }
   const bezahlung = { tabellen: bezTabellen, gutscheine, paypal: paypalEingerichtet(env), paypalEchtgeld: !!(env && env.PAYPAL_LIVE === '1'), ueberweisung: !!ueberweisungDaten(env), freischalten: !!adminToken(env), beleg: !!belegAnschrift(env) };
@@ -1383,6 +1388,7 @@ async function gesundheit(env) {
     ok: true, dienst: DIENST, version: VERSION,
     datenbank: !!(env && env.DB), tabellen, abgleich, dateien, freigaben, stufen, rollen, verleih, mitnutzung, planung, stoerungsmail: true, waechter,
     routen: { tabellen: routenTab, schluessel: !!(env && typeof env.HERE_SCHLUESSEL === 'string' && env.HERE_SCHLUESSEL.trim().length >= 8) },
+    lesen: { tabelle: lesenTab, schluessel: !!(env && typeof env.GOOGLE_VISION_KEY === 'string' && env.GOOGLE_VISION_KEY.trim().length >= 8) },
     recherche: !!(env && typeof env.RECHERCHE_URL === 'string' && /^https:\/\//.test(env.RECHERCHE_URL) && typeof env.RECHERCHE_TOKEN === 'string' && env.RECHERCHE_TOKEN.length >= 8),
     pepper: typeof (env && env.PASSWORT_PEPPER) === 'string' && env.PASSWORT_PEPPER.length >= 32,
     mail: !!(env && env.EMAIL && env.ABSENDER),
@@ -1397,12 +1403,12 @@ async function gesundheit(env) {
 
 /* Die Zahlen sind Richtwerte (Nutzer, 12.11.2026). Sie stehen nur hier und in js/konto.js (ein Test vergleicht beide). */
 export const STUFEN = {
-  basic: { name: 'Basic', geraete: 2, checks: 0, routen: 0, fahrzeuge: 1, online: false },
-  test: { name: 'Testwoche', geraete: 4, checks: 1, routen: 10, fahrzeuge: 3, online: true },
-  mittel: { name: 'Mittel', geraete: 4, checks: 3, routen: 100, fahrzeuge: 3, online: true },
-  voll: { name: 'Voll', geraete: 10, checks: 10, routen: 1000, fahrzeuge: null, online: true },
+  basic: { name: 'Basic', geraete: 2, checks: 0, routen: 0, fahrzeuge: 1, online: false, scans: 0 },
+  test: { name: 'Testwoche', geraete: 4, checks: 1, routen: 10, fahrzeuge: 3, online: true, scans: 10 },
+  mittel: { name: 'Mittel', geraete: 4, checks: 3, routen: 100, fahrzeuge: 3, online: true, scans: 50 },
+  voll: { name: 'Voll', geraete: 10, checks: 10, routen: 1000, fahrzeuge: null, online: true, scans: 100 },
   /* Nur für den Entwickler, nur per SQL setzbar, keine Grenzen (null = unbegrenzt). Nur die Bremse gegen zu viele Checks hintereinander bleibt. */
-  entwickler: { name: 'Entwickler', geraete: null, checks: null, routen: null, fahrzeuge: null, online: true }
+  entwickler: { name: 'Entwickler', geraete: null, checks: null, routen: null, fahrzeuge: null, online: true, scans: null }
 };
 export const TESTWOCHE_TAGE = 7;
 export const CHECK_ZEITRAUM_TAGE = 365;
@@ -1657,6 +1663,121 @@ async function routePlanen(request, env, db, jetzt, optionen) {
   return { ok: true, route: erg, kontingent, fahrzeugAngaben: fz };
 }
 
+/* ---------- 13g: Lesedienst für Smart Capture (seit 2.0.98) ---------- */
+
+/* Festlegung des Nutzers (16.11.2026): Smart Capture liest das Foto beim Google-Dienst (Cloud Vision, EU-Adresse). Nur für Konten mit bezahlter Stufe
+   (Mittel 50, Voll 100 Scans pro Konto und Monat; ein Foto = ein Scan, Vorder- und Rückseite zählen als zwei). Ein ermäßigter oder geschenkter Preis ändert
+   die Grenze nicht, sie richtet sich nur nach der Stufe. Der Dienst speichert weder das Foto noch den Text, er zählt nur (Tabelle lese_nutzung).
+   Der Zugangsschlüssel steht nur als Secret GOOGLE_VISION_KEY im Worker. Der Monat ist der Kalendermonat nach UTC. */
+const VISION_URL = 'https://eu-vision.googleapis.com/v1/images:annotate';
+const ZEIT_VISION_MS = 40 * 1000;
+const MAX_LESEN_BILD = 3 * 1024 * 1024;         /* Zeichen der Base64-Schrift, rund 2,2 MB Bild */
+const MAX_LESEN_WOERTER = 3000;
+const MAX_LESEN_TEXT = 30000;
+
+function monatVon(jetzt) { const d = new Date(jetzt); return { anfang: Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1), name: d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') }; }
+
+/* Wie viele Scans in diesem Monat gezählt sind (laufende und gelungene). Fehlt die Tabelle noch, ist es null. */
+async function lesenGenutzt(db, dr, jetzt, stufeId) {
+  try {
+    /* Die Testwoche zählt über die ganze Woche (nur Scans, die in der Testwoche gemacht wurden), alle anderen Stufen je Kalendermonat. */
+    const z = stufeId === 'test'
+      ? await db.prepare('SELECT COUNT(*) AS n FROM lese_nutzung WHERE datenraum_id = ? AND stufe = ? AND status IN (?, ?)').bind(dr, 'test', 'laeuft', 'ok').first()
+      : await db.prepare('SELECT COUNT(*) AS n FROM lese_nutzung WHERE datenraum_id = ? AND am >= ? AND status IN (?, ?)').bind(dr, monatVon(jetzt).anfang, 'laeuft', 'ok').first();
+    return z ? z.n : 0;
+  } catch (e) { if (fehltTabelle(e)) return 0; throw e; }
+}
+
+function bildPruefen(roh) {
+  const b = typeof roh === 'string' ? roh.replace(/^data:[^,]*,/, '').replace(/\s+/g, '') : '';
+  if (!b || b.length < 100) throw new HttpFehler(400, 'Es wurde kein Bild mitgeschickt.', { feld: 'bild' });
+  if (b.length > MAX_LESEN_BILD) throw new HttpFehler(413, 'Das Bild ist zu groß.', { feld: 'bild' });
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b)) throw new HttpFehler(400, 'Das Bild ist nicht lesbar.', { feld: 'bild' });
+  const kopf = b.slice(0, 8);
+  /* JPEG beginnt mit FF D8 FF (Base64 „/9j/“), PNG mit 89 50 4E 47 (Base64 „iVBOR“) */
+  if (!/^\/9j\//.test(kopf) && !/^iVBOR/.test(kopf)) throw new HttpFehler(400, 'Das Bild muss ein JPEG oder PNG sein.', { feld: 'bild' });
+  return b;
+}
+
+/* Die Antwort von Google auf das Wesentliche kürzen: Wörter mit den vier Eckpunkten (x0,y0,x1,y1,x2,y2,x3,y3), Sicherheit 0 bis 100 und „Zeilenende“. */
+export function visionAuswerten(j) {
+  const r = j && Array.isArray(j.responses) ? j.responses[0] : null;
+  if (!r || typeof r !== 'object') throw new HttpFehler(502, 'Der Lesedienst hat keine lesbare Antwort geschickt. Dieser Versuch wurde nicht gezählt.');
+  if (r.error) throw new HttpFehler(502, 'Der Lesedienst konnte das Foto nicht lesen. Dieser Versuch wurde nicht gezählt.');
+  const fa = r.fullTextAnnotation;
+  const seite = fa && Array.isArray(fa.pages) ? fa.pages[0] : null;
+  const woerter = [];
+  let breite = 0, hoehe = 0;
+  if (seite) {
+    breite = Math.round(Number(seite.width) || 0); hoehe = Math.round(Number(seite.height) || 0);
+    for (const bl of seite.blocks || []) for (const pa of bl.paragraphs || []) for (const wo of pa.words || []) {
+      if (woerter.length >= MAX_LESEN_WOERTER) break;
+      const sy = wo.symbols || [];
+      const t = sy.map((x) => String(x.text || '')).join('').trim();
+      if (!t) continue;
+      const vs = wo.boundingBox && Array.isArray(wo.boundingBox.vertices) ? wo.boundingBox.vertices : [];
+      if (vs.length < 4) continue;
+      const v = [];
+      for (let i = 0; i < 4; i++) { v.push(Math.round(Number(vs[i].x) || 0), Math.round(Number(vs[i].y) || 0)); }
+      const letzte = sy.length ? sy[sy.length - 1] : null;
+      const br = letzte && letzte.property && letzte.property.detectedBreak ? letzte.property.detectedBreak.type : '';
+      const k = typeof wo.confidence === 'number' ? Math.max(0, Math.min(100, Math.round(wo.confidence * 100))) : 50;
+      woerter.push({ t: t.slice(0, 80), v, k, e: br === 'EOL_SURE_SPACE' || br === 'LINE_BREAK' ? 1 : 0 });
+    }
+  }
+  return { text: fa && typeof fa.text === 'string' ? fa.text.slice(0, MAX_LESEN_TEXT) : '', breite, hoehe, woerter };
+}
+
+async function lesenSenden(request, env, db, jetzt, optionen) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request, MAX_LESEN_BILD + 4096);
+  if (b.zustimmung !== true) throw new HttpFehler(400, 'Ohne deine Zustimmung wird kein Foto zum Lesen gesendet.', { feld: 'zustimmung' });
+  const bild = bildPruefen(b.bild);
+  if (!a.datenraumId) throw new HttpFehler(400, 'Zu diesem Konto gehört noch kein Datenraum.');
+  const st = await stufeVon(db, a.id, jetzt, false);
+  const grenze = st.grenzen.scans;
+  if (grenze === 0) throw new HttpFehler(402, 'Smart Capture gibt es mit der Stufe Mittel oder Voll. Deine Stufe ist ' + st.name + '.', { stufe: st.id, grund: 'stufe' });
+  const schluessel = env && typeof env.GOOGLE_VISION_KEY === 'string' ? env.GOOGLE_VISION_KEY.trim() : '';
+  if (schluessel.length < 8) throw new HttpFehler(503, 'Der Lesedienst ist im Konto-Dienst noch nicht eingetragen.');
+  await bremsen(db, await schluesselFuer('les', a.datenraumId), 20, 10 * MINUTE, jetzt, 'Es wurden zu viele Fotos hintereinander gesendet.');
+  const monat = monatVon(jetzt);
+  const genutzt = await lesenGenutzt(db, a.datenraumId, jetzt, st.id);
+  if (grenze !== null && genutzt >= grenze) {
+    throw new HttpFehler(402, st.id === 'test' ? 'Deine Scans der Testwoche sind aufgebraucht: ' + genutzt + ' von ' + grenze + '. Mit Mittel oder Voll gibt es jeden Monat neue Scans. Bis dahin kannst du die Erkennung auf dem Gerät nehmen.' : 'Dein Kontingent für diesen Monat ist aufgebraucht: ' + genutzt + ' von ' + grenze + ' Scans. Ab dem 1. des nächsten Monats gibt es wieder neue. Bis dahin kannst du die Erkennung auf dem Gerät nehmen.', { genutzt, grenze, stufe: st.id, grund: 'limit', monat: monat.name });
+  }
+  const nid = crypto.randomUUID();
+  await db.prepare('INSERT INTO lese_nutzung (id, datenraum_id, stufe, am, status) VALUES (?, ?, ?, ?, ?)').bind(nid, a.datenraumId, st.id, jetzt, 'laeuft').run();
+  async function zurueck() { try { await db.prepare('DELETE FROM lese_nutzung WHERE id = ?').bind(nid).run(); } catch (e) { /* wird später aufgeräumt */ } }
+  const holen = (optionen && optionen.fetch) || fetch;
+  const koerper = JSON.stringify({ requests: [{ image: { content: bild }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }], imageContext: { languageHints: ['de'] } }] });
+  let r, text;
+  try {
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), ZEIT_VISION_MS) : null;
+    try {
+      r = await holen(VISION_URL + '?key=' + encodeURIComponent(schluessel), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: koerper, signal: ctl ? ctl.signal : undefined });
+      text = await r.text();
+    } finally { if (timer) clearTimeout(timer); }
+  } catch (e) {
+    await zurueck();
+    throw new HttpFehler(502, 'Der Lesedienst hat nicht rechtzeitig geantwortet. Dieser Versuch wurde nicht gezählt.');
+  }
+  let j = null;
+  try { j = JSON.parse(text); } catch (e) { j = null; }
+  if (!r.ok || !j || typeof j !== 'object') {
+    await zurueck();
+    throw new HttpFehler(502, 'Der Lesedienst konnte das Foto nicht lesen (Antwort ' + (r && r.status) + '). Dieser Versuch wurde nicht gezählt.');
+  }
+  let erg;
+  try { erg = visionAuswerten(j); } catch (e) { await zurueck(); throw e; }
+  await db.prepare('UPDATE lese_nutzung SET status = ? WHERE id = ?').bind('ok', nid).run();
+  return Object.assign({ ok: true }, erg, { kontingent: { genutzt: genutzt + 1, grenze, stufe: st.id, monat: monat.name } });
+}
+
+async function lesenAufraeumen(db, jetzt) {
+  try { await db.prepare('DELETE FROM lese_nutzung WHERE am <= ? OR (status = ? AND am <= ?)').bind(jetzt - 400 * TAG, 'laeuft', jetzt - 1 * TAG).run(); } catch (e) { if (!fehltTabelle(e)) throw e; }
+}
+
 async function kontoStufe(request, env, db, jetzt) {
   const a = await authentifizieren(request, db, jetzt);
   const st = await stufeVon(db, a.id, jetzt, false);
@@ -1664,12 +1785,14 @@ async function kontoStufe(request, env, db, jetzt) {
   const geraete = await db.prepare('SELECT COUNT(*) AS n FROM sitzung WHERE nutzer_id = ? AND laeuft_ab > ?').bind(a.id, jetzt).first();
   const genutzt = a.datenraumId && g.online ? await checksGenutzt(db, a.datenraumId, st.id, jetzt) : 0;
   const routen = { genutzt: a.datenraumId && g.online ? await routenGenutzt(db, a.datenraumId, st.id, jetzt) : 0, extra: await routenExtraFrei(db, a.id) };
+  const scans = a.datenraumId && g.scans !== 0 ? await lesenGenutzt(db, a.datenraumId, jetzt, st.id) : 0;
   return {
     ok: true,
     stufe: { id: st.id, name: st.name, bis: st.bis },
-    grenzen: { geraete: g.geraete, checks: g.checks, routen: g.routen, fahrzeuge: g.fahrzeuge, online: g.online },
+    grenzen: { geraete: g.geraete, checks: g.checks, routen: g.routen, fahrzeuge: g.fahrzeuge, online: g.online, scans: g.scans },
     nutzung: { geraete: geraete ? geraete.n : 0, checks: genutzt, checksFrei: g.checks === null ? null : Math.max(0, g.checks - genutzt), zeitraumTage: CHECK_ZEITRAUM_TAGE, extra: await extraFrei(db, a.id),
-      routen: routen.genutzt, routenFrei: g.routen === null ? null : Math.max(0, g.routen - routen.genutzt), routenExtra: routen.extra },
+      routen: routen.genutzt, routenFrei: g.routen === null ? null : Math.max(0, g.routen - routen.genutzt), routenExtra: routen.extra,
+      scans, scansFrei: g.scans === null ? null : Math.max(0, g.scans - scans), scansMonat: monatVon(jetzt).name },
     rolle: await rolleVon(db, a.email)
   };
 }
@@ -1896,6 +2019,7 @@ export async function behandeln(request, env, optionen) {
       'POST /rolle/entfernen': rolleEntfernen,
       'POST /check/senden': checkSenden,
       'POST /route/planen': routePlanen,
+      'POST /lesen/senden': lesenSenden,
       'POST /bezahlen/starten': bezahlenStarten,
       'POST /gutschein/pruefen': gutscheinPruefen,
       'POST /gutschein/einloesen': gutscheinEinloesen,
@@ -1925,7 +2049,7 @@ export async function behandeln(request, env, optionen) {
     return antwort(200, erg, cors);
   } catch (e) {
     if (e instanceof HttpFehler) return antwort(e.status, Object.assign({ ok: false, error: e.message }, e.extra), cors);
-    if (e && /no such table/i.test(String(e.message || e))) return antwort(503, { ok: false, error: 'Im Dienst fehlen Tabellen in der Datenbank. Die SQL-Zeilen der Einrichtung (Schritt 13b, 13d, 13c, 13e und 13e-5) müssen noch ausgeführt werden.' }, cors);
+    if (e && /no such table/i.test(String(e.message || e))) return antwort(503, { ok: false, error: 'Im Dienst fehlen Tabellen in der Datenbank. Die SQL-Zeilen der Einrichtung (Schritt 13b, 13d, 13c, 13e, 13e-5 und 13g) müssen noch ausgeführt werden.' }, cors);
     return antwort(500, { ok: false, error: 'Im Dienst ist ein Fehler aufgetreten.' }, cors);
   }
 }
