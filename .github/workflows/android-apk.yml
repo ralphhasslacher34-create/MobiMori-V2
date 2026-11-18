@@ -1,39 +1,54 @@
 name: Android-APK bauen
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   apk:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Neueste ZIP-Datei auspacken
+        run: |
+          ZIP=$(ls MobiMory-V2_*.zip | sort -V | tail -n 1)
+          echo "Verwendet wird: $ZIP"
+          mkdir app
+          unzip -q "$ZIP" -d app
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
       - uses: android-actions/setup-android@v3
-      - run: npm ci
-      - run: npm test
+      - name: Werkzeuge installieren
+        working-directory: app
+        run: npm ci
+      - name: Tests
+        working-directory: app
+        run: npm test
       - name: Dateien für die Hülle
+        working-directory: app
         run: |
           rm -rf www
           mkdir www
           cp -r index.html manifest.webmanifest sw.js css js icons lib www/
-      - run: npx cap sync android
+      - name: Hülle abgleichen
+        working-directory: app
+        run: npx cap sync android
       - name: Debug-APK bauen
-        working-directory: android
+        working-directory: app/android
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: MobiMory-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: app/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
