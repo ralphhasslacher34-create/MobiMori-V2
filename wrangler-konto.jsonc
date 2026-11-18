@@ -12,7 +12,7 @@
     { "pattern": "konto.mobimory.com", "custom_domain": true }
   ],
   "vars": {
-    "ERLAUBTE_URSPRUENGE": "https://app.mobimory.com",
+    "ERLAUBTE_URSPRUENGE": "https://app.mobimory.com,https://localhost",
     "ABSENDER": "konto@mobimory.com"
   },
   // Kosten-Wächter (seit 2.0.71, Dienst 13e-3): läuft alle 15 Minuten. Empfänger und Schwellen stehen als Variablen im Dashboard (siehe server/EINRICHTUNG.md).
