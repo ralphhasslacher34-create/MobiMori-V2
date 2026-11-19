@@ -324,17 +324,41 @@ async function codeSenden(env, db, email, zweck, jetzt) {
 
 /* ---------- Sitzung ---------- */
 
-async function sitzungAnlegen(db, nutzerId, geraet, jetzt) {
+/* Geräte-Lage eines Kontos (seit 2.0.117): Ist die Grenze der Stufe erreicht, und welches ist das älteste angemeldete Gerät? */
+async function geraeteLage(db, nutzerId, jetzt, geraet) {
+  const st = await stufeVon(db, nutzerId, jetzt, true);
+  if (!st || !st.grenzen || st.grenzen.geraete === null) return { voll: false, st: st };
+  /* Meldet sich ein Gerät noch einmal an, das schon angemeldet ist (gleiche Kennung), ersetzt es seine alte Sitzung und braucht keinen neuen Platz. */
+  const km = /#([a-f0-9]{8,16})$/.exec(geraet || '');
+  const z = km
+    ? await db.prepare('SELECT COUNT(*) AS n FROM sitzung WHERE nutzer_id = ? AND laeuft_ab > ? AND (geraet IS NULL OR geraet NOT LIKE ?)').bind(nutzerId, jetzt, '%#' + km[1]).first()
+    : await db.prepare('SELECT COUNT(*) AS n FROM sitzung WHERE nutzer_id = ? AND laeuft_ab > ?').bind(nutzerId, jetzt).first();
+  const voll = !!z && z.n >= st.grenzen.geraete;
+  let aeltestes = null;
+  if (voll) {
+    const a = await db.prepare('SELECT geraet, erstellt_am FROM sitzung WHERE nutzer_id = ? AND laeuft_ab > ? ORDER BY erstellt_am ASC LIMIT 1').bind(nutzerId, jetzt).first();
+    if (a) aeltestes = { name: a.geraet || 'Unbekanntes Gerät', erstelltAm: a.erstellt_am };
+  }
+  return { voll, st, anzahl: z ? z.n : 0, aeltestes };
+}
+
+function geraeteVollFehler(lage) {
+  const st = lage.st;
+  return new HttpFehler(403, 'Mit der Stufe ' + st.name + ' sind höchstens ' + st.grenzen.geraete + ' Geräte erlaubt. Melde zuerst ein anderes Gerät ab.',
+    { stufe: st.id, geraeteGrenze: st.grenzen.geraete, geraeteVoll: true, aeltestes: lage.aeltestes });
+}
+
+async function sitzungAnlegen(db, nutzerId, geraet, jetzt, aeltestesAbmelden) {
   /* 13e: Die App hängt eine Kennung des Geräts an den Namen („… #ab12cd34“). Meldet sich dasselbe Gerät noch einmal an, ersetzt die neue Sitzung die alte.
      Der Name allein genügt nicht, er ist bei allen Geräten gleich. Danach gilt die Geräte-Grenze der Stufe. */
   const km = /#([a-f0-9]{8,16})$/.exec(geraet || '');
   if (km) await db.prepare('DELETE FROM sitzung WHERE nutzer_id = ? AND geraet LIKE ?').bind(nutzerId, '%#' + km[1]).run();
-  const st = await stufeVon(db, nutzerId, jetzt, true);
-  if (st && st.grenzen) {
-    const z = await db.prepare('SELECT COUNT(*) AS n FROM sitzung WHERE nutzer_id = ? AND laeuft_ab > ?').bind(nutzerId, jetzt).first();
-    if (z && st.grenzen.geraete !== null && z.n >= st.grenzen.geraete) {
-      throw new HttpFehler(403, 'Mit der Stufe ' + st.name + ' sind höchstens ' + st.grenzen.geraete + ' Geräte erlaubt. Melde zuerst ein anderes Gerät ab.', { stufe: st.id, geraeteGrenze: st.grenzen.geraete });
-    }
+  const lage = await geraeteLage(db, nutzerId, jetzt);
+  if (lage.voll) {
+    /* Seit 2.0.117: Mit dem Wunsch „ältestes Gerät abmelden“ macht der Dienst Platz, sonst meldet er die volle Grenze (mit dem ältesten Gerät, damit die App es anbieten kann). */
+    if (aeltestesAbmelden !== true) throw geraeteVollFehler(lage);
+    const frei = lage.anzahl - lage.st.grenzen.geraete + 1;
+    await db.prepare('DELETE FROM sitzung WHERE token_hash IN (SELECT token_hash FROM sitzung WHERE nutzer_id = ? AND laeuft_ab > ? ORDER BY erstellt_am ASC LIMIT ?)').bind(nutzerId, jetzt, frei).run();
   }
   const token = zuBase64Url(zufall(32));
   const laeuftAb = jetzt + SITZUNG_TAGE * TAG;
@@ -345,9 +369,9 @@ async function sitzungAnlegen(db, nutzerId, geraet, jetzt) {
 
 function geraetName(roh) { return typeof roh === 'string' ? roh.trim().slice(0, 60) : ''; }
 
-async function sitzungAnwort(db, nutzerId, geraet, jetzt) {
+async function sitzungAnwort(db, nutzerId, geraet, jetzt, aeltestesAbmelden) {
   const n = await db.prepare('SELECT n.email AS email, n.passwort_hash AS passwort_hash, d.id AS dr_id, d.name AS dr_name FROM nutzer n LEFT JOIN datenraum d ON d.nutzer_id = n.id WHERE n.id = ?').bind(nutzerId).first();
-  const s = await sitzungAnlegen(db, nutzerId, geraet, jetzt);
+  const s = await sitzungAnlegen(db, nutzerId, geraet, jetzt, aeltestesAbmelden);
   return { ok: true, token: s.token, laeuftAb: s.laeuftAb, email: n.email, datenraum: { id: n.dr_id, name: n.dr_name }, passwortGesetzt: !!n.passwort_hash };
 }
 
@@ -427,6 +451,11 @@ async function codePruefen(request, env, db, jetzt) {
     await db.prepare('UPDATE code SET versuche = versuche + 1 WHERE email = ?').bind(email).run();
     throw new HttpFehler(400, falsch, { feld: 'code' });
   }
+  /* Seit 2.0.117: Ist die Geräte-Grenze erreicht und hat die App nicht „ältestes Gerät abmelden“ gewünscht, bleibt der richtige Code gültig. Sonst wäre er verbraucht, bevor die App fragen kann. */
+  if (b.aeltestesAbmelden !== true) {
+    const vorhanden = await db.prepare('SELECT id FROM nutzer WHERE email = ?').bind(email).first();
+    if (vorhanden) { const lage = await geraeteLage(db, vorhanden.id, jetzt, geraetName(b.geraet)); if (lage.voll) throw geraeteVollFehler(lage); }
+  }
   /* Der Code gilt nur einmal. */
   await db.prepare('DELETE FROM code WHERE email = ?').bind(email).run();
 
@@ -450,7 +479,7 @@ async function codePruefen(request, env, db, jetzt) {
   await db.batch(stmts);
   /* 13e: Die Testwoche gibt es einmal je bestätigter E-Mail-Adresse, nur beim ersten Bestätigen. */
   if (neuBestaetigt) await testwocheStarten(db, env, id, email, jetzt);
-  return sitzungAnwort(db, id, geraetName(b.geraet), jetzt);
+  return sitzungAnwort(db, id, geraetName(b.geraet), jetzt, b.aeltestesAbmelden === true);
 }
 
 async function anmelden(request, env, db, jetzt) {
@@ -469,7 +498,7 @@ async function anmelden(request, env, db, jetzt) {
   if (!r.ok) throw abgewiesen;
   if (r.veraltet) await db.prepare('UPDATE nutzer SET passwort_hash = ? WHERE id = ?').bind(await passwortHashen(pw, g), n.id).run();
   await db.prepare('UPDATE nutzer SET letzte_anmeldung = ? WHERE id = ?').bind(jetzt, n.id).run();
-  return sitzungAnwort(db, n.id, geraetName(b.geraet), jetzt);
+  return sitzungAnwort(db, n.id, geraetName(b.geraet), jetzt, b.aeltestesAbmelden === true);
 }
 
 async function ich(request, env, db, jetzt) {
@@ -493,6 +522,27 @@ async function passwortSetzen(request, env, db, jetzt) {
 async function abmelden(request, env, db, jetzt) {
   const a = await authentifizieren(request, db, jetzt);
   await db.prepare('DELETE FROM sitzung WHERE token_hash = ?').bind(a.hash).run();
+  return { ok: true };
+}
+
+/* Geräteverwaltung (seit 2.0.117): Liste der gültigen Sitzungen dieses Kontos. Die Kennung ist der Anfang des Abdrucks, nicht der Schlüssel selbst. */
+async function geraeteListe(request, env, db, jetzt) {
+  const a = await authentifizieren(request, db, jetzt);
+  const r = await db.prepare('SELECT token_hash, geraet, erstellt_am, laeuft_ab FROM sitzung WHERE nutzer_id = ? AND laeuft_ab > ? ORDER BY erstellt_am ASC').bind(a.id, jetzt).all();
+  const zeilen = (r && r.results) || [];
+  return { ok: true, geraete: zeilen.map((z) => ({ kennung: z.token_hash.slice(0, 16), name: z.geraet || 'Unbekanntes Gerät', erstelltAm: z.erstellt_am, laeuftAb: z.laeuft_ab, eigenes: z.token_hash === a.hash })) };
+}
+
+/* Beendet die Sitzung eines anderen Geräts des eigenen Kontos. Das eigene Gerät meldet sich mit „abmelden“ ab. */
+async function geraetAbmelden(request, env, db, jetzt) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request);
+  const k = typeof b.kennung === 'string' ? b.kennung : '';
+  if (!/^[a-f0-9]{16}$/.test(k)) throw new HttpFehler(400, 'Dieses Gerät ist nicht bekannt.', { feld: 'kennung' });
+  if (a.hash.slice(0, 16) === k) throw new HttpFehler(400, 'Dieses Gerät meldest du mit „Abmelden“ ab.', { feld: 'kennung' });
+  const z = await db.prepare('SELECT token_hash FROM sitzung WHERE nutzer_id = ? AND substr(token_hash, 1, 16) = ?').bind(a.id, k).first();
+  if (!z) throw new HttpFehler(404, 'Dieses Gerät ist nicht mehr angemeldet.', { feld: 'kennung' });
+  await db.prepare('DELETE FROM sitzung WHERE token_hash = ? AND nutzer_id = ?').bind(z.token_hash, a.id).run();
   return { ok: true };
 }
 
@@ -2023,6 +2073,8 @@ export async function behandeln(request, env, optionen) {
       'GET /konto/ich': ich,
       'POST /konto/passwort-setzen': passwortSetzen,
       'POST /konto/abmelden': abmelden,
+      'GET /konto/geraete': geraeteListe,
+      'POST /konto/geraet-abmelden': geraetAbmelden,
       'POST /konto/loeschen': loeschen,
       'GET /abgleich/stand': abgleichStandWeg,
       'GET /abgleich/aenderungen': abgleichAenderungen,
