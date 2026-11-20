@@ -28,6 +28,7 @@
  * 13c: Freigaben je Fahrzeug und Zeitraum (nur lesen, höchstens 12 Monate, Einladung per Code an die E-Mail-Adresse des Gastes) und die Kontroll-Freigabe
  *      per Code (ohne Konto, nur Papiere und Prüfergebnis, höchstens 7 Tage). Die Rechte werden bei jeder Anfrage auf dem Server geprüft. Zwei weitere
  *      Tabellen „freigabe“ und „kontrolle“ (schema.sql, ab „13c“).
+ * 13h: Alarm-Nachrichten (Push und E-Mail) an die angemeldeten Geräte, Tabelle push_ziel (seit 2.0.120)
  * 13g: Lesedienst für Smart Capture (Google Cloud Vision, EU-Adresse): Foto rein, Text mit Positionen raus, nichts gespeichert, nur gezählt (Tabelle lese_nutzung).
  *      Secret GOOGLE_VISION_KEY im Worker.
  * 13e: Stufen (Basic, Testwoche, Mittel, Voll, Entwickler ohne Grenzen) mit Grenzen für Geräte und Online-Checks. Die Online-Checks gehen über diesen Dienst: Er prüft Anmeldung,
@@ -66,7 +67,7 @@
  */
 
 export const DIENST = 'mobimory-konto';
-export const VERSION = '13g';
+export const VERSION = '13h';
 
 /* Die Laufzeit von Cloudflare lehnt mehr als 100 000 Runden ab. Die Zahl steht im gespeicherten Wert, sie lässt sich später erhöhen. */
 export const PBKDF2_RUNDEN = 100000;
@@ -572,7 +573,7 @@ export const ABGLEICH_TABELLEN = ['fahrzeuge', 'eintraege', 'komponenten', 'komp
   /* seit 2.0.119 (synchron auf allen Geräten): Anforderungen, Standorte und einige Einstellungs-Dokumente */
   'anforderungen', 'standorte', 'einstellungen'];
 /* Von den Einstellungen gehen nur diese Dokumente mit (Wechselpunkte, Tagesrouten, Cockpit-Wechsel, Kartenauswahl, Prüfung des Schlüsselworts). */
-export const EINSTELLUNG_ID = /^(wechselpunkte-|tagroute-|wechsel-|kartenwahl|wortpruefung$)/;
+export const EINSTELLUNG_ID = /^(wechselpunkte-|tagroute-|wechsel-|wache-|kartenwahl|wortpruefung$)/;
 export const ABGLEICH_VERLAUF_TYPEN = ['zaehler', 'frist', 'vorgang', 'aktivitaet', 'besatzung', 'verantwortung', 'tagesabschnitt', 'ereignis', 'aktivitaetsart',
   'ereignisart', 'ort', 'gebiet', 'regel', 'person', 'tier', 'adresse',
   'dokument', 'kosten', 'kostenstamm', 'kostenart', 'zahlungsmittel', 'kassenbuchung', 'besuch', 'route', 'nachweisart', 'nachweis'];
@@ -585,7 +586,7 @@ export const DATEI_TABELLEN = ['dateien', 'nachweisdateien', 'ereignisdateien', 
 /* Diese Angaben gehen nie im Klartext hinaus. Taucht einer dieser Schlüssel in einem Datensatz auf, lehnt der Dienst ihn ab.
    Seit 2.0.119 kommen die empfindlichen Angaben als Block „@geheim“, verschlüsselt mit dem Schlüsselwort des Nutzers; der Dienst kann ihn nicht lesen. */
 export const LOKALE_SCHLUESSEL = ['notiz', 'abschlussNotiz', 'erledigtNotiz', 'email', 'telefon', 'chipnummer', 'adresse', 'ansprechpartner',
-  'geburtsdatum', 'wohnort', 'inhalt', 'spur', 'geheim'];
+  'geburtsdatum', 'wohnort', 'inhalt', 'spur', 'geheim', 'wachepos'];
 
 function raumVon(a) {
   if (!a.datenraumId) throw new HttpFehler(409, 'Zu diesem Konto gibt es keinen Datenraum.');
@@ -1758,6 +1759,113 @@ async function routePlanen(request, env, db, jetzt, optionen) {
   return { ok: true, route: erg, kontingent, fahrzeugAngaben: fz };
 }
 
+/* ---------- 13h: Alarm-Nachrichten an die angemeldeten Geräte (seit 2.0.120) ----------
+   Ein Gerät (die Wache) meldet „Alarm“. Der Dienst schickt an alle ANDEREN Geräte des Kontos eine Push-Nachricht und an die E-Mail-Adresse des Kontos
+   eine E-Mail. Der Text ist allgemein gehalten und enthält keine Position und keinen Fahrzeugnamen: Er geht über die Dienste von Google, Mozilla und Apple.
+   Web-Push (Browser, Tablet): VAPID-Schlüssel (Geheimnisse VAPID_PRIVAT als JWK-Text und VAPID_OEFFENTLICH), Nachricht ohne Inhalt, die App holt den Text selbst.
+   Android-Hülle: Firebase Cloud Messaging (Geheimnis FCM_KONTO = Dienstkonto-Schlüssel als JSON-Text). */
+
+const PUSH_DIENSTE = ['fcm.googleapis.com', 'updates.push.services.mozilla.com', 'push.apple.com', 'notify.windows.com', 'push.services.mozilla.com'];
+const ALARM_TEXT = { titel: 'MobiMory: Alarm', text: 'Eine deiner Wachen hat ausgelöst. Bitte MobiMory öffnen.' };
+
+function pushZielOk(art, ziel) {
+  if (typeof ziel !== 'string' || !ziel) return false;
+  if (art === 'fcm') return /^[A-Za-z0-9_:\-.]{20,4096}$/.test(ziel);
+  if (art !== 'web' || ziel.length > 1000) return false;
+  let u;
+  try { u = new URL(ziel); } catch (e) { return false; }
+  if (u.protocol !== 'https:' || u.username || u.password || u.port) return false;
+  return PUSH_DIENSTE.some((d) => u.hostname === d || u.hostname.endsWith('.' + d));
+}
+
+async function pushAnmelden(request, env, db, jetzt) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request);
+  const geraet = typeof b.geraet === 'string' ? b.geraet : '';
+  if (!/^[A-Za-z0-9_-]{4,64}$/.test(geraet)) throw new HttpFehler(400, 'Die Gerätekennung ist ungültig.', { feld: 'geraet' });
+  if (!pushZielOk(b.art, b.ziel)) throw new HttpFehler(400, 'Diese Push-Adresse nimmt der Dienst nicht an.', { feld: 'ziel' });
+  await db.prepare('INSERT INTO push_ziel (id, nutzer_id, geraet, art, ziel, erstellt_am) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(nutzer_id, geraet) DO UPDATE SET art = excluded.art, ziel = excluded.ziel, erstellt_am = excluded.erstellt_am')
+    .bind('pz' + zuBase64Url(zufall(9)), a.id, geraet, b.art, b.ziel, jetzt).run();
+  return { ok: true };
+}
+
+async function pushAbmelden(request, env, db, jetzt) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request);
+  const geraet = typeof b.geraet === 'string' ? b.geraet : '';
+  if (!/^[A-Za-z0-9_-]{4,64}$/.test(geraet)) throw new HttpFehler(400, 'Die Gerätekennung ist ungültig.', { feld: 'geraet' });
+  await db.prepare('DELETE FROM push_ziel WHERE nutzer_id = ? AND geraet = ?').bind(a.id, geraet).run();
+  return { ok: true };
+}
+
+async function pushSchluessel(request, env, db, jetzt) {
+  await authentifizieren(request, db, jetzt);
+  return { ok: true, vapid: env.VAPID_OEFFENTLICH || null, fcm: !!env.FCM_KONTO };
+}
+
+const textBytes = (t) => new TextEncoder().encode(t);
+
+async function vapidKopf(env, endpoint, jetzt) {
+  const jwk = JSON.parse(env.VAPID_PRIVAT);
+  const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const kopf = zuBase64Url(textBytes(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const inhalt = zuBase64Url(textBytes(JSON.stringify({ aud: new URL(endpoint).origin, exp: Math.floor(jetzt / 1000) + 12 * 3600, sub: 'mailto:' + (env.ABSENDER_ADRESSE || 'info@mobimory.com') })));
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, textBytes(kopf + '.' + inhalt)));
+  return 'vapid t=' + kopf + '.' + inhalt + '.' + zuBase64Url(sig) + ', k=' + env.VAPID_OEFFENTLICH;
+}
+
+async function webPushSenden(env, ziel, jetzt) {
+  const r = await fetch(ziel, { method: 'POST', headers: { Authorization: await vapidKopf(env, ziel, jetzt), TTL: '3600', Urgency: 'high', 'Content-Length': '0' } });
+  return { ok: r.status >= 200 && r.status < 300, weg: r.status === 404 || r.status === 410 };
+}
+
+async function fcmToken(env, jetzt) {
+  const k = JSON.parse(env.FCM_KONTO);
+  const pem = String(k.private_key).replace(/-----[A-Z ]+-----/g, '').replace(/\s+/g, '');
+  const key = await crypto.subtle.importKey('pkcs8', ausBase64Url(pem.replace(/\+/g, '-').replace(/\//g, '_')), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+  const jetztS = Math.floor(jetzt / 1000);
+  const kopf = zuBase64Url(textBytes(JSON.stringify({ alg: 'RS256', typ: 'JWT' })));
+  const inhalt = zuBase64Url(textBytes(JSON.stringify({ iss: k.client_email, scope: 'https://www.googleapis.com/auth/firebase.messaging', aud: 'https://oauth2.googleapis.com/token', iat: jetztS, exp: jetztS + 3000 })));
+  const sig = zuBase64Url(new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, textBytes(kopf + '.' + inhalt))));
+  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + kopf + '.' + inhalt + '.' + sig });
+  if (!r.ok) throw new Error('FCM-Anmeldung abgelehnt');
+  return { token: (await r.json()).access_token, projekt: k.project_id };
+}
+
+async function fcmSenden(env, t, ziel) {
+  const r = await fetch('https://fcm.googleapis.com/v1/projects/' + encodeURIComponent(t.projekt) + '/messages:send', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + t.token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: { token: ziel, notification: { title: ALARM_TEXT.titel, body: ALARM_TEXT.text }, android: { priority: 'HIGH', notification: { channel_id: 'alarm' } }, data: { art: 'alarm' } } }) });
+  return { ok: r.ok, weg: r.status === 404 };
+}
+
+async function alarmSenden(request, env, db, jetzt) {
+  const a = await authentifizieren(request, db, jetzt);
+  const b = await bodyLesen(request);
+  const eigenes = typeof b.geraet === 'string' && /^[A-Za-z0-9_-]{4,64}$/.test(b.geraet) ? b.geraet : '';
+  await bremsen(db, 'alarm:' + a.id, 12, 10 * MINUTE, jetzt, 'Es wurden zu viele Alarme gesendet. Bitte warte einige Minuten.');
+  const r = await db.prepare('SELECT id, geraet, art, ziel FROM push_ziel WHERE nutzer_id = ?').bind(a.id).all();
+  const ziele = ((r && r.results) || []).filter((z) => z.geraet !== eigenes);
+  let gesendet = 0, fehler = 0, fcmT = null;
+  for (const z of ziele) {
+    try {
+      let e;
+      if (z.art === 'web' && env.VAPID_PRIVAT && env.VAPID_OEFFENTLICH) e = await webPushSenden(env, z.ziel, jetzt);
+      else if (z.art === 'fcm' && env.FCM_KONTO) { if (!fcmT) fcmT = await fcmToken(env, jetzt); e = await fcmSenden(env, fcmT, z.ziel); }
+      else { fehler++; continue; }
+      if (e.ok) gesendet++; else fehler++;
+      if (e.weg) await db.prepare('DELETE FROM push_ziel WHERE id = ?').bind(z.id).run();
+    } catch (err) { fehler++; }
+  }
+  let mail = false;
+  try {
+    const m = await mailSenden(env, a.email, ALARM_TEXT.titel, ALARM_TEXT.text + '\n\nDiese Nachricht kommt von einer Wache in deinem MobiMory-Konto.');
+    mail = !!m.gesendet;
+  } catch (err) { mail = false; }
+  return { ok: true, push: gesendet, fehler, mail };
+}
+
 /* ---------- 13g: Lesedienst für Smart Capture (seit 2.0.98) ---------- */
 
 /* Festlegung des Nutzers (16.11.2026): Smart Capture liest das Foto beim Google-Dienst (Cloud Vision, EU-Adresse). Nur für Konten mit bezahlter Stufe
@@ -2137,6 +2245,10 @@ export async function behandeln(request, env, optionen) {
       'GET /verwaltung/bestellungen': verwaltungBestellungen,
       'POST /verwaltung/bestaetigen': verwaltungBestaetigen,
       'POST /verwaltung/direkt': verwaltungDirekt,
+      'GET /push/schluessel': pushSchluessel,
+      'POST /push/anmelden': pushAnmelden,
+      'POST /push/abmelden': pushAbmelden,
+      'POST /alarm/senden': alarmSenden,
       'POST /verwaltung/loeschen': verwaltungLoeschen
     };
     const f = wege[weg];
