@@ -48,7 +48,7 @@ jobs:
         run: |
           rm -rf www
           mkdir www
-          cp -r index.html manifest.webmanifest sw.js css js icons lib www/
+          cp -r index.html manifest.webmanifest sw.js css js icons lib handbuch www/
       - name: Hülle abgleichen
         working-directory: app
         run: npx cap sync android
